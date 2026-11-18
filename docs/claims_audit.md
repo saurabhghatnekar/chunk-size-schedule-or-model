@@ -58,3 +58,22 @@ A claim is not allowed into the abstract or introduction unless its row names a 
 | Training with these kernels is not reproducible run to run: three reruns of one configuration and seed span 0.003 to 0.004 nats, about the seed spread | **measured** | `results/pilot_precision.csv` rows with `replicate` 0 and 1, plus `results/pilot_precision_from_log.csv` | Two configurations. One of the three reruns in each is read from a run log to four decimals |
 | With the triangular solve also set to IEEE, the Gated DeltaNet kernel at chunk 64 matches the float64 recurrence to float32 rounding | **measured** | `results/pilot_precision.csv`, column `kernel_oracle_dev`, `regime == fp32_ieee` | Forward pass only |
 | IEEE dot products cost throughput at chunk 64: about 56k tokens/s against 157k (TF32) and 232k (bfloat16) for this model on an A10; at chunk 16 the gap is small (140k against 175k) | **measured** | `results/pilot_precision.csv`, column `tokens_per_s` | One model size, one GPU, no tuning |
+
+## Claims from the small architectural pilot (5.2M parameters, enwik8, NVIDIA A10)
+
+| Claim | Status | Support | Caveat |
+|---|---|---|---|
+| Under the pre-registered unpaired rule, the pilot is uninformative about chunk length for a LaCT-style layer | **measured** | `results/tables/pilot_architectural_summary.csv`, columns `F`, `s_within`, `largest_gap_to_anchor`, `verdict`; criteria in `docs/go_no_go_architectural.md` | The rule assumed runs are independent draws; see next row |
+| Within a seed, loss rises with chunk length: chunk 512 worse than chunk 32, and no test-time training worse than chunk 32, in 5 of 5 seeds | **open** (post hoc) | `results/pilot_architectural.csv`, `val_loss` by `seed` and `chunk`; table in `docs/pilot_architectural.md` | Analysis chosen after seeing the data. No same-seed reruns, so the run-to-run floor of this model is unknown. Needs new seeds and a paired test fixed in advance |
+| A model trained with test-time training loses about 0.016 nats when evaluated with it switched off; a model trained without gains nothing from switching it on | **measured**, descriptive | `results/pilot_architectural.csv`, columns `val_loss_at_chunk_*` | Small model; means over five runs |
+| Chunk length changes throughput about five-fold for this layer: 41k tokens/s at chunk 32, 117k at 128, 151k at 512, 206k with no fast-weight updates | **measured** | `results/pilot_architectural.csv`, column `tokens_per_s` | The official op without `torch.compile` or the fused kernel, one GPU |
+
+## Claims from the confirmatory pilot and the budget (NVIDIA A10 for training, H100 for throughput)
+
+| Claim | Status | Support | Caveat |
+|---|---|---|---|
+| The pre-registered confirmatory test (chunk 32 gives lower loss than chunk 512 at equal steps, six new seeds, paired t, one-sided 1%) did not pass | **measured** | `results/tables/pilot_confirmatory_summary.csv`, rung A, columns `t`, `t_crit`, `verdict`; rule in `docs/go_no_go_confirmatory.md` | t = 2.73 against 3.365 |
+| In those six new seeds chunk 512 was worse than chunk 32 every time, by 4 to 31 run-to-run floors | **measured**, outside the registered rule | same table, columns `d_per_seed`, `d_min`, `floor` | Not the registered statistic. May be described, may not be called a confirmed effect |
+| The direction holds at about 39M parameters in 3 of 3 seeds | **measured**, weak | same table, rung B | Three seeds; no test of its own |
+| Reruns of the LaCT-style model with one seed differ by at most 0.0013 nats, far less than the Gated DeltaNet kernel model (0.003 to 0.004) | **measured** | `results/pilot_confirmatory.csv`, rows with `replicate` 0, 1, 2 | Two configurations, three runs each |
+| Training throughput of the LaCT-style model at 160M and 410M parameters, by chunk length, and the cost of the reduced grid | **measured** / arithmetic | `results/throughput_lact.csv`, `results/tables/compute_budget.csv`, `docs/compute_budget.md` | Context 1024, the op without `torch.compile` or its fused kernel, list prices of 2026-11-18, one row measured on an H200 |

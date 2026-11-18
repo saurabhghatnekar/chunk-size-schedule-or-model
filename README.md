@@ -112,6 +112,47 @@ of one.
 Details and limits: [docs/pilot_precision.md](docs/pilot_precision.md). This is a small model trained for
 minutes; it does not bound what happens at the scale of the planned study.
 
+## Second training result: a small pilot on the architectural class
+
+The other question: for a layer where the chunk boundary is part of the function, does chunk length change
+trained quality? A 5.2M-parameter byte-level model whose blocks sum a fixed-window attention and the official
+LaCT fast-weight op was trained at chunk 32, 128 and 512 on a 1024-byte context, plus chunk 1024 as an anchor
+(one chunk means the op never updates its fast weights), five seeds each. Criteria were written down first
+([docs/go_no_go_architectural.md](docs/go_no_go_architectural.md)).
+
+**Verdict under the rule fixed beforehand: uninformative.** The rule treated runs as independent, and across
+seeds the loss varies by 0.02 nats, more than the 0.018 gap between the best cell and the anchor.
+
+**But the rule's noise model was wrong for this layer, and the data show a consistent pattern.** Within every
+seed the loss rises with chunk length: chunk 512 is worse than chunk 32 in 5 of 5 seeds (mean +0.011 nats) and
+the anchor is worse than chunk 32 in 5 of 5 (mean +0.018). This is a post-hoc reading and does not count as a
+result; it is a specific prediction to test with new seeds and a paired test fixed in advance.
+
+Chunk length also sets throughput: 41k tokens/s at chunk 32 against 206k with test-time training off, so the
+equal-steps comparison above is far from an equal-wall-clock one. Details:
+[docs/pilot_architectural.md](docs/pilot_architectural.md).
+
+## Confirmatory pilot and the go/no-go decision
+
+The post-hoc pattern above was tested on six seeds that had not been used, with a seed-paired test and the
+combination rule fixed in advance ([docs/go_no_go_confirmatory.md](docs/go_no_go_confirmatory.md)), plus
+same-seed reruns for a noise floor and a second rung at about 39M parameters.
+
+**By the rule as written: no-go for the full paper.** The test needed a paired t above 3.365 (one-sided 1%)
+and got 2.73, so the hypothesis is not confirmed at the registered level.
+
+**What the rule did not use.** Chunk 512 was worse than chunk 32 in 6 of 6 new seeds, and in 3 of 3 at the
+larger size. The run-to-run floor of this model is 0.0013 nats; the smallest difference was 0.0057 and the
+mean 0.015. The test fell short because one seed's difference, in the predicted direction, was four times the
+others and inflated the variance. A paired t-test at 1% with six seeds was a fragile choice made before the
+data. The verdict stands as registered; the facts are reported so a reader can weigh them.
+
+The compute budget for the reduced grid, from throughput measured at 160M and 410M parameters on an H100, is
+about $690 per seed per billion training tokens, two thirds of it chunk 32
+([docs/compute_budget.md](docs/compute_budget.md)).
+
+Everything in one place: [docs/go_no_go_decision.md](docs/go_no_go_decision.md).
+
 ## Reproduce
 
 Requires [uv](https://docs.astral.sh/uv/). Everything on CPU runs in a few minutes.
@@ -153,14 +194,16 @@ The last line is the ablation behind point 2 above; its rows are in `results/equ
 | `docs/classification.md` | the result in full, generated from the CSVs |
 | `docs/claims_audit.md` | every claim with its status and the file and column that support it |
 | `src/pilot/`, `modal_pilot.py` | the small precision pilot: training loop around the library kernel, and its analysis |
-| `docs/go_no_go.md`, `docs/pilot_precision.md` | decision criteria fixed in advance, and the pilot's outcome against them |
+| `docs/go_no_go*.md` | decision criteria, each fixed before its pilot ran, and `go_no_go_decision.md`, the outcome |
+| `docs/pilot_*.md` | each pilot's outcome against its criteria |
+| `docs/compute_budget.md`, `results/throughput_lact.csv` | measured training throughput and the cost of the reduced grid |
 
 ## Where this is going
 
 | Milestone | Weeks | State |
 |---|---|---|
 | 1. Equivalence test and classification, before any training | 1-2 | test, controls, classification, matrix and kernel tier done; hand derivations, abstract and novelty memo not written |
-| 2. Pilot, throughput model, joint quality model, go or no-go | 3-4 | criteria written; a small precision pilot run (no effect detected in three arithmetics); pilot at planned scale, architectural pilot, throughput and joint models not started |
+| 2. Pilot, throughput model, joint quality model, go or no-go | 3-4 | three small pilots run against criteria fixed in advance; throughput measured at the planned sizes and the reduced grid costed; decision document written (no-go by the registered rule, with the evidence the rule did not use reported beside it); roadmap-scale pilots and the joint model not done |
 | 3. Reduced grid, baselines, choice-space definition | 5-6 | not started |
 | 4. Joint quality surface, precision study, wall-clock question | 7-8 | not started |
 | 5. Ablations, mechanism, hardware condition | 9-10 | not started |

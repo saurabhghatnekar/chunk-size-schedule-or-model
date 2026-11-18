@@ -273,13 +273,23 @@ the variant was still compiling; in an earlier run the same variants ran into th
     if ieee_csv.exists():
         both = []
         for label, frame in (("default", kframe), ("ieee", pd.read_csv(ieee_csv))):
-            sub = frame[(frame["dtype"] == "float32") & frame["oracle_fwd_max_rel"].notna()
-                        & frame["variant"].astype(str).str.startswith("chunk")]
-            both.append(sub.groupby("architecture")["oracle_fwd_max_rel"].max().rename(label))
-        table = pd.concat(both, axis=1).dropna()
-        ablation = ("Result of that rerun, worst float32 oracle deviation over chunk sizes, default then IEEE: "
-                    + "; ".join(f"`{a}` {fmt(r['default'])} then {fmt(r['ieee'])}" for a, r in table.iterrows()) + ".")
+            sub = frame[(frame["dtype"] == "float32") & frame["oracle_fwd_max_rel"].notna()].copy()
+            sub["what"] = sub["variant"].str.replace(" (size fixed by the kernel)", "", regex=False) + ":" + sub["chunk"].astype(int).astype(str)
+            both.append(sub.groupby(["architecture", "what"], sort=False)["oracle_fwd_max_rel"].max().rename(label))
+        table = pd.concat(both, axis=1).dropna().reset_index()
+        table["arch"] = "`" + table["architecture"] + "`"
+        table["default_s"], table["ieee_s"] = table["default"].map(fmt), table["ieee"].map(fmt)
+        ablation_title = "The cause is TF32: switching the dot products to IEEE removes it."
+        ablation = ("Rerunning the float32 kernels with `TRITON_F32_DEFAULT=ieee` (worst output deviation from the "
+                    "float64 oracle over both sequence lengths):\n\n"
+                    + md_table(table, {"arch": "Kernel", "what": "Variant:chunk", "default_s": "Triton default (TF32)", "ieee_s": "IEEE"})
+                    + "\n\n   The recurrent kernels are unchanged, as they have no dot products. The chunked kernels fall to "
+                    "float32 rounding, with one exception: `chunk_gated_delta_rule` at chunk 64 keeps a residual about "
+                    "three orders of magnitude above rounding. That kernel selects TF32 explicitly for its triangular "
+                    "solve, which the environment switch does not override; whether that is the source of the residual "
+                    "has not been checked.")
     else:
+        ablation_title = "The likely cause is TF32, and it has not been isolated."
         ablation = "That rerun has **not** been done yet, so TF32 remains the likely cause and not a demonstrated one."
     return f"""## Result: Triton kernels (GPU, run on Modal)
 
@@ -310,7 +320,9 @@ and the float32 and float16 rows are the informative ones.
    `chunk_gated_delta_rule`, `chunk_simple_gla` and `chunk_gla` sit near 1e-3 from it at every chunk size.
    That is four orders of magnitude above float32 rounding and well below a structural difference, which is
    why the rule returns INCONCLUSIVE for them.
-2. **The likely cause is TF32, and it has not been isolated.** On a GPU with tensor cores Triton's `tl.dot`
+   Read with point 2, those INCONCLUSIVE rows are a precision effect of the kernel's default arithmetic and
+   not a chunk boundary: the classification of these architectures as scheduling stands.
+2. **{ablation_title}** On a GPU with tensor cores Triton's `tl.dot`
    defaults to TF32 for float32 operands (its documentation, Triton {kframe['triton'].iloc[0]}: "For devices that do have
    tensor cores, the default precision is tf32"). The chunked kernels use `tl.dot`; the recurrent ones do
    not. At the pinned commit the delta-rule kernels force IEEE in most dot products but refuse float32 input

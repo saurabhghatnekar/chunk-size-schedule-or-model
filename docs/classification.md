@@ -264,14 +264,31 @@ Inputs with an all-zero gradient in every variant that ran (for LaCT this is exp
    `chunk_gated_delta_rule`, `chunk_simple_gla` and `chunk_gla` sit near 1e-3 from it at every chunk size.
    That is four orders of magnitude above float32 rounding and well below a structural difference, which is
    why the rule returns INCONCLUSIVE for them.
-2. **The likely cause is TF32, and it has not been isolated.** On a GPU with tensor cores Triton's `tl.dot`
+   Read with point 2, those INCONCLUSIVE rows are a precision effect of the kernel's default arithmetic and
+   not a chunk boundary: the classification of these architectures as scheduling stands.
+2. **The cause is TF32: switching the dot products to IEEE removes it.** On a GPU with tensor cores Triton's `tl.dot`
    defaults to TF32 for float32 operands (its documentation, Triton 3.9.0: "For devices that do have
    tensor cores, the default precision is tf32"). The chunked kernels use `tl.dot`; the recurrent ones do
    not. At the pinned commit the delta-rule kernels force IEEE in most dot products but refuse float32 input
    outright, the gated delta-rule forward kernel explicitly selects TF32 for its triangular solve, and the
    scalar-decay and shared chunk kernels leave the default. Triton exposes `TRITON_F32_DEFAULT=ieee`;
    `CHUNK_TRITON_F32=ieee uv run modal run modal_app.py --only ...` reruns the kernels that way.
-   That rerun has **not** been done yet, so TF32 remains the likely cause and not a demonstrated one.
+   Rerunning the float32 kernels with `TRITON_F32_DEFAULT=ieee` (worst output deviation from the float64 oracle over both sequence lengths):
+
+| Kernel | Variant:chunk | Triton default (TF32) | IEEE |
+|---|---|---|---|
+| `fla_chunk_gated_delta_rule` | fused_recurrent:1 | 3.8e-07 | 3.8e-07 |
+| `fla_chunk_gated_delta_rule` | chunk:16 | 1.9e-03 | 3.0e-07 |
+| `fla_chunk_gated_delta_rule` | chunk:32 | 1.9e-03 | 3.6e-07 |
+| `fla_chunk_gated_delta_rule` | chunk:64 | 1.8e-03 | 1.7e-04 |
+| `fla_chunk_simple_gla` | fused_recurrent:1 | 4.9e-07 | 4.9e-07 |
+| `fla_chunk_simple_gla` | chunk:16 | 1.6e-03 | 3.0e-07 |
+| `fla_chunk_simple_gla` | chunk:32 | 1.6e-03 | 3.1e-07 |
+| `fla_chunk_simple_gla` | chunk:64 | 1.7e-03 | 4.2e-07 |
+| `fla_chunk_gla` | fused_recurrent:1 | 1.3e-06 | 1.3e-06 |
+| `fla_chunk_gla` | chunk:64 | 1.5e-03 | 5.0e-07 |
+
+   The recurrent kernels are unchanged, as they have no dot products. The chunked kernels fall to float32 rounding, with one exception: `chunk_gated_delta_rule` at chunk 64 keeps a residual about three orders of magnitude above rounding. That kernel selects TF32 explicitly for its triangular solve, which the environment switch does not override; whether that is the source of the residual has not been checked.
 3. **The feasible chunk sizes are set by the kernel, the GPU and the Triton version together.** See the
    refusals table: a fixed list of sizes for the delta-rule kernels, powers of two for the scalar-decay
    kernel, no choice at all for `chunk_gla`, block sizes that exceed this GPU's shared memory for the

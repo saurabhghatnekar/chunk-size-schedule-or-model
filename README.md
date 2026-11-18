@@ -76,11 +76,11 @@ each kernel is compared with a float64 oracle on the same inputs. What that show
    at every chunk size they accept. That is consistent with scheduling, but it is a weak bound: in bfloat16
    this test cannot see even a 1% per-boundary defect.
 2. **With float32 inputs the chunked kernels are about 1e-3 from the exact recurrence** at every chunk size,
-   while the recurrent kernels match it to 1e-6. Triton's dot product defaults to TF32 for float32 operands on
-   tensor-core GPUs, the chunked kernels use it and the recurrent ones do not. That is the likely cause and
-   it has **not** been isolated yet (the IEEE rerun is prepared but not run). If it holds, "float32" on these
-   kernels is not float32, and chunking leaves a numerical fingerprint four orders of magnitude larger than
-   float32 rounding. That matters for the planned precision study.
+   while the recurrent kernels match it to 1e-6. The cause is TF32: Triton's dot product defaults to TF32 for
+   float32 operands on tensor-core GPUs, and rerunning with `TRITON_F32_DEFAULT=ieee` brings the chunked
+   kernels down to about 3e-7 (one exception: Gated DeltaNet at chunk 64 keeps a residual near 2e-4). So on
+   these kernels "float32" is not float32 by default, and choosing the chunked form over the recurrent one
+   costs about four orders of magnitude of numerical agreement. That matters for the planned precision study.
 3. **The test-time-training kernels are chunk-dependent and match their per-chunk reference**, as expected.
 4. **Kernels constrain which chunk sizes can be studied at all.** At the pinned commits, on this GPU: the
    delta-rule kernels accept only 16, 32 and 64 (and DeltaNet refuses float32 input); the scalar-decay kernel
@@ -90,6 +90,27 @@ each kernel is compared with a float64 oracle on the same inputs. What that show
 Two things found along the way that may be worth reporting upstream after confirmation: the library's
 closed-form Titans op returns NaN gradients when the chunk does not divide the sequence, and large chunk sizes
 can spend many minutes in Triton's compiler before failing.
+
+## First training result: a small precision pilot
+
+One question from the plan can be asked cheaply: for a layer whose chunkwise form is exact, does the chunk
+length change the *trained* model once arithmetic is not exact? A 5.3M-parameter byte-level model on enwik8
+with the library's Gated DeltaNet kernel was trained at chunk 16 and chunk 64, three seeds each, in three
+arithmetics: bfloat16, float32 with Triton's TF32 default, and float32 with IEEE dot products. The criteria
+were written down first ([docs/go_no_go.md](docs/go_no_go.md)).
+
+**No effect detected in any arithmetic.** At a fixed seed, chunk 64 against chunk 16 moved the final held-out
+loss by at most 0.002 nats (bfloat16), 0.0004 (TF32) and 0.0008 (IEEE), against a seed-to-seed spread of about
+0.004. The size of the difference does not track the size of the kernel's numerical error, which spans four
+orders of magnitude across the three arithmetics.
+
+**Training with these kernels is not reproducible run to run.** Three reruns of one configuration with the
+same seed gave final losses spanning 0.003 to 0.004 nats, as wide as the spread across seeds. So the seed is
+not what sets the noise here, and a same-seed comparison of two chunk lengths is no tighter than two reruns
+of one.
+
+Details and limits: [docs/pilot_precision.md](docs/pilot_precision.md). This is a small model trained for
+minutes; it does not bound what happens at the scale of the planned study.
 
 ## Reproduce
 
@@ -108,10 +129,10 @@ The kernel tier needs a CUDA GPU. It is set up for [Modal](https://modal.com):
 ```bash
 uv run modal run modal_app.py                                  # every kernel, default GPU
 CHUNK_GPU=H100 uv run modal run modal_app.py                   # another GPU; rows are keyed by GPU model
-CHUNK_TRITON_F32=ieee uv run modal run modal_app.py --only fla_chunk_simple_gla,fla_chunk_gla,fla_chunk_gated_delta_rule
+CHUNK_TRITON_F32=ieee uv run modal run modal_app.py --only fla_chunk_simple_gla,fla_chunk_gla,fla_chunk_gated_delta_rule --dtype float32
 ```
 
-The last line is the pending ablation for point 2 above.
+The last line is the ablation behind point 2 above; its rows are in `results/equivalence_kernels_ieee.csv`.
 
 ## Layout
 
@@ -131,13 +152,15 @@ The last line is the pending ablation for point 2 above.
 | `results/` | every number in the documents: raw CSVs, summary tables, the figure |
 | `docs/classification.md` | the result in full, generated from the CSVs |
 | `docs/claims_audit.md` | every claim with its status and the file and column that support it |
+| `src/pilot/`, `modal_pilot.py` | the small precision pilot: training loop around the library kernel, and its analysis |
+| `docs/go_no_go.md`, `docs/pilot_precision.md` | decision criteria fixed in advance, and the pilot's outcome against them |
 
 ## Where this is going
 
 | Milestone | Weeks | State |
 |---|---|---|
 | 1. Equivalence test and classification, before any training | 1-2 | test, controls, classification, matrix and kernel tier done; hand derivations, abstract and novelty memo not written |
-| 2. Pilot, throughput model, joint quality model, go or no-go | 3-4 | not started |
+| 2. Pilot, throughput model, joint quality model, go or no-go | 3-4 | criteria written; a small precision pilot run (no effect detected in three arithmetics); pilot at planned scale, architectural pilot, throughput and joint models not started |
 | 3. Reduced grid, baselines, choice-space definition | 5-6 | not started |
 | 4. Joint quality surface, precision study, wall-clock question | 7-8 | not started |
 | 5. Ablations, mechanism, hardware condition | 9-10 | not started |
@@ -146,8 +169,7 @@ The last line is the pending ablation for point 2 above.
 The plan itself ("the roadmap" in the documents here) is a separate document and is not part of this
 repository.
 
-Open items for Milestone 1: derive the chunkwise forms by hand; rerun the float32 kernels with IEEE dot
-products; repeat the kernel tier on a second GPU; repeat the test on a trained checkpoint; write the
+Open items for Milestone 1: derive the chunkwise forms by hand; repeat the kernel tier on a second GPU; repeat the test on a trained checkpoint; write the
 paragraph on why the HLA and FLASH ablations do not transfer to an exact kernel.
 
 ## Acknowledgements and licences

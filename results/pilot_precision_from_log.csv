@@ -1,0 +1,3 @@
+regime,chunk,seed,replicate,step,train_loss,val_loss_own,val_loss_ref,tokens_per_s,wall_s,kernel_oracle_dev,source
+bf16,64,0,2,2000,1.1856,1.2063,1.2062,232000,320,6.44e-03,"run log of the second launch (four decimal places): the run finished but its rows were not returned. Kept as a third rerun of this configuration"
+fp32_tf32,64,0,2,2000,1.1834,1.2034,1.2034,145000,506,1.76e-03,"run log of the second launch (four decimal places): the run finished but its rows were not returned. Kept as a third rerun of this configuration"

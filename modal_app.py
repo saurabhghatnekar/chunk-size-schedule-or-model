@@ -48,7 +48,7 @@ TRITON_F32 = os.environ.get("CHUNK_TRITON_F32", "")
 UNIT_TIMEOUT = 900
 
 
-@app.function(gpu=GPU, cpu=8.0, timeout=UNIT_TIMEOUT, max_containers=40)
+@app.function(gpu=GPU, cpu=8.0, timeout=UNIT_TIMEOUT, max_containers=10)
 def kernel_unit(name: str, dtype_name: str, seq_len: int, triton_f32: str = ""):
     """One (kernel, input format, sequence length) per container, streamed back row by row, so a hang in one
     kernel variant costs that variant and nothing else."""
@@ -108,7 +108,7 @@ def triton_dot_precision() -> str:
 
 
 @app.local_entrypoint()
-def main(only: str = ""):
+def main(only: str = "", dtype: str = ""):
     import datetime as dt
     from concurrent.futures import ThreadPoolExecutor
 
@@ -118,7 +118,7 @@ def main(only: str = ""):
     from src.equivalence.kernels.run import base_row
 
     cases = [c for c in CASES if not only or c.name in only.split(",")]
-    units = [(c, d, t) for c in cases for t in c.seq_lens for d in c.dtypes]
+    units = [(c, d, t) for c in cases for t in c.seq_lens for d in c.dtypes if not dtype or d in dtype.split(",")]
 
     def collect(unit):
         case, dtype_name, seq_len = unit

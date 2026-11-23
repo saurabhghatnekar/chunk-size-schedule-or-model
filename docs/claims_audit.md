@@ -87,3 +87,13 @@ A claim is not allowed into the abstract or introduction unless its row names a 
 | A trained LaCT-style model is still architectural-class: the difference across chunk lengths is the same in float32 and float64 | **measured** | same file | One small model |
 | On trained weights the library's Gated DeltaNet kernel is about 1e-3 from the float64 recurrence under the TF32 default and about 2e-6 with IEEE dot products, in outputs and gradients of a six-layer model | **measured** | same file, `tier == trained-kernel`, columns `oracle_fwd_max_rel`, `oracle_grad_max_rel` | One GPU (A10), batch of two validation windows |
 | The official LaCT op under bfloat16 autocast follows its per-chunk float64 reference to about three quantisation floors on trained weights | **measured** | same file, LaCT rows, `oracle_fwd_max_rel` against `floor_fwd_max_rel` | Outputs only |
+
+## Claims from the released checkpoints (NVIDIA A10; mamba_ssm and flash-linear-attention at pinned commits)
+
+| Claim | Status | Support | Caveat |
+|---|---|---|---|
+| The official Mamba-2 chunked kernel reproduces the float64 recurrence on real activations of `state-spaces/mamba2-130m` to float32 rounding under IEEE dot products, at chunk 16 to 1024 | **measured** | `results/equivalence_released.csv`, `case == mamba2`, `level == kernel`, `arithmetic == ieee`, `regime == fp32` | Three layers, one batch of text. The plain path of the layer, not its fused path |
+| The same kernel is about 1.5e-3 from the recurrence under Triton's TF32 default | **measured** | same file, `arithmetic == tf32 default` | One GPU |
+| `fla-hub/gla-340M-15B`: chunked against recurrent kernel, logits differ by 8e-4 under TF32 and 1e-6 under IEEE | **measured** | same file, `case == gla`, `level == model` | Chunk size is fixed by that kernel, so there is no sweep |
+| `fla-hub/delta_net-1.3B-100B`: in bfloat16 the chunked kernel's outputs are within about two quantisation floors of the recurrence; its gradients are further off and worsen with chunk size | **measured** | same file, `case == delta_net`, `level == kernel` | bfloat16 only: the chunked kernel refuses float32 |
+| In bfloat16, changing only the chunk size or kernel variant changes the top-scoring token at 0.8% to 3.4% of positions on these released models | **measured** | same file, `level == model`, `regime == bf16`, column `top1_agreement` | 2048 positions of one text. Not compared with another perturbation of the same size, so this is sensitivity to rounding, not something special about chunking |

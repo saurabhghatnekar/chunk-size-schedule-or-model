@@ -196,6 +196,93 @@ def figure(frame: pd.DataFrame, summary: pd.DataFrame, path_stem) -> None:
     plt.close(fig)
 
 
+def released_section(frame: pd.DataFrame) -> str:
+    """Publicly released checkpoints through their authors' kernels, from results/equivalence_released.csv."""
+    ok = frame[frame["status"].astype(str) == "ok"].copy()
+    label = {("tf32 default", "fp32"): "float32, Triton default (TF32)", ("ieee", "fp32"): "float32, IEEE dot products",
+             ("tf32 default", "bf16"): "bfloat16 autocast"}
+    model = ok[(ok["level"] == "model") & (ok["fwd_max_rel"] > 0)]
+    mlines = ["| Released model | Code | Arithmetic | Compared with | Chunk sizes | Largest logit deviation | Lowest top-1 agreement |",
+              "|---|---|---|---|---|---|---|"]
+    klines = ["| Released model | Arithmetic | Kernel variant | Layers | Dev. from float64 recurrence, outputs | Same, gradients | Quantisation floor |",
+              "|---|---|---|---|---|---|---|"]
+    kern = ok[ok["level"] == "kernel"]
+    for case, g in ok.groupby("model", sort=False):
+        code = g["implementation"].iloc[0]
+        for key, name in label.items():
+            m = model[(model["model"] == case) & (model["arithmetic"] == key[0]) & (model["regime"] == key[1])]
+            if len(m):
+                ref = f"{m['ref_variant'].iloc[0]}" + ("" if m["ref_variant"].iloc[0] != "chunk" else f" {int(m['ref_chunk'].iloc[0])}")
+                chunks = " ".join(str(int(c)) for c in m["chunk"])
+                mlines.append(f"| `{case}` | {code} | {name} | {ref} | {chunks} | {fmt(m['fwd_max_rel'].max())} | {m['top1_agreement'].min():.4f} |")
+            k = kern[(kern["model"] == case) & (kern["arithmetic"] == key[0]) & (kern["regime"] == key[1])]
+            for variant, kv in k.groupby("variant", sort=False):
+                chunks = " ".join(str(int(c)) for c in dict.fromkeys(kv["chunk"]))
+                klines.append(f"| `{case}` | {name} | {variant} ({chunks}) | {kv['layer'].nunique()} | {fmt(kv['oracle_fwd_max_rel'].max())} | "
+                              f"{fmt(kv['oracle_grad_max_rel'].max())} | {fmt(kv['floor_fwd_max_rel'].max())} |")
+    refused = frame[frame["status"].astype(str).str.startswith("error")]
+    refusal = ("\nRefused: " + "; ".join(dict.fromkeys(
+        f"`{r['model']}` {r['variant']} in {r['regime']}: {str(r['status'])[7:120]}" for _, r in refused.iterrows())) + ".\n") if len(refused) else ""
+    def worst(level, column, **where):
+        sub = ok[ok["level"] == level]
+        for key, value in where.items():
+            sub = sub[sub[key] == value]
+        return sub[column].max() if len(sub) else float("nan")
+
+    chunked = ok["variant"].astype(str).str.startswith("chunk")
+    kc = ok[(ok["level"] == "kernel") & chunked]
+    ieee = kc[(kc["arithmetic"] == "ieee") & (kc["regime"] == "fp32")]
+    tf32 = kc[(kc["arithmetic"] == "tf32 default") & (kc["regime"] == "fp32")]
+    bf = ok[(ok["level"] == "model") & (ok["regime"] == "bf16") & (ok["fwd_max_rel"] > 0)]
+    kbf = kc[kc["regime"] == "bf16"]
+    m_ieee = ieee[ieee["model"].str.contains("mamba2")].groupby("chunk")["oracle_fwd_max_rel"].max()
+    delta = kbf[kbf["model"].str.contains("delta_net")].groupby("chunk")["oracle_grad_max_rel"].max()
+    points = [
+        f"- **Mamba-2 and GLA are scheduling-class with real weights.** With IEEE dot products their chunked kernels "
+        f"reproduce the token-by-token recurrence on real activations to between {fmt(ieee['oracle_fwd_max_rel'].min())} and "
+        f"{fmt(ieee['oracle_fwd_max_rel'].max())}, at every chunk size tested.",
+        f"- **DeltaNet can only be checked in bfloat16**, because its chunked kernel refuses float32. There its outputs are "
+        f"within about {kbf[kbf['model'].str.contains('delta_net')]['oracle_fwd_max_rel'].max() / kbf[kbf['model'].str.contains('delta_net')]['floor_fwd_max_rel'].max():.0f} "
+        f"quantisation floors of the recurrence at chunk 16, 32 and 64. Its gradients drift further as the chunk grows: "
+        + ", ".join(f"{fmt(v)} at chunk {int(c)}" for c, v in delta.items()) + ".",
+        f"- **The TF32 gap is in Mamba-2's official kernels as well.** With Triton's default the chunked kernels are between "
+        f"{fmt(tf32['oracle_fwd_max_rel'].min())} and {fmt(tf32['oracle_fwd_max_rel'].max())} from the recurrence on released weights, in both libraries.",
+        f"- **In bfloat16 each kernel call sits near the quantisation floor, but the model does not.** Across 24 layers the "
+        f"rounding compounds: changing only the chunk size or kernel variant moves the logits by {fmt(bf['fwd_max_rel'].min())} to "
+        f"{fmt(bf['fwd_max_rel'].max())} of their scale and changes the top-scoring token at {100 * (1 - bf['top1_agreement'].max()):.1f}% to "
+        f"{100 * (1 - bf['top1_agreement'].min()):.1f}% of positions. This is sensitivity to rounding, with the chunk size as the "
+        f"perturbation; it was not compared with any other perturbation of the same size.",
+        f"- **Rounding grows with the chunk.** Under IEEE float32 the Mamba-2 kernel is {fmt(m_ieee.iloc[0])} from the recurrence at "
+        f"chunk {int(m_ieee.index[0])} and {fmt(m_ieee.iloc[-1])} at chunk {int(m_ieee.index[-1])}." if len(m_ieee) else "",
+    ]
+    first = ok.iloc[0]
+    return f"""## Result: publicly released checkpoints, through their authors' kernels
+
+The same question asked of models other people trained and released, run through the code they ship:
+`state-spaces/mamba2-130m` with the official `mamba_ssm` kernels, and `fla-hub/delta_net-1.3B-100B` and
+`fla-hub/gla-340M-15B` with flash-linear-attention's kernels. The input is two windows of 1024 tokens of
+real text, tokenised with each model's own tokenizer. {first['gpu']}, torch {first['torch']}, triton {first['triton']},
+sources {first['sources']}.
+
+**Whole model.** The logits at each chunk size (or kernel variant) against a reference configuration: the
+recurrent kernel where the library has one, the default chunk size otherwise. Top-1 agreement is the fraction
+of the 2048 positions where the highest-scoring next token is the same.
+
+{chr(10).join(mlines)}
+{refusal}
+**One kernel call, real activations.** The inputs that the first, middle and last layer actually hand to their
+kernel are captured during a forward pass and the kernel is replayed on them, against the float64
+token-by-token recurrence. Worst over the three layers and over the chunk sizes listed:
+
+{chr(10).join(klines)}
+
+What this shows:
+
+{chr(10).join(points)}
+
+"""
+
+
 def trained_section(frame: pd.DataFrame) -> str:
     """The same test on two small trained models, from results/equivalence_trained.csv."""
     from .precision_scaling import classify as classify_verdict
@@ -249,8 +336,8 @@ KERNEL_SCOPE_UNTESTED = """- **Implementations, not architectures in general.** 
 
 KERNEL_SCOPE_TESTED = """- **Implementations, not architectures in general.** The reference tier is code written for this project
   from the papers. The library and kernel tiers cover the pinned commits of flash-linear-attention and LaCT
-  on the GPUs named above, with `torch.compile` disabled. The official Mamba-2 kernels (`mamba_ssm`) are not
-  covered; `chunk_simple_gla` is the same scalar-decay recurrence but a different kernel."""
+  on the GPUs named above, with `torch.compile` disabled. The official Mamba-2 kernels (`mamba_ssm`) are
+  covered in the released-checkpoint section, through their plain path and not their fused one."""
 
 
 def kernel_section(kframe: pd.DataFrame) -> str:
@@ -409,7 +496,7 @@ and the float32 and float16 rows are the informative ones.
 
 
 def document(frame: pd.DataFrame, summary: pd.DataFrame, control_lines: list[str], controls_passed: bool,
-             kernels_md: str = "", trained_md: str = "") -> str:
+             kernels_md: str = "", trained_md: str = "", released_md: str = "") -> str:
     cfg = ModelConfig()
     env = frame.iloc[0]
     view = summary.copy()
@@ -532,7 +619,7 @@ run a copy of the same source with those casts lifted to float64, used only for 
 {per_chunk_table(frame, "library", "float32", "fwd_max_rel")}
 
 {kernels_md}
-{trained_md}## Low precision (descriptive only; this is what the precision study in Milestones 2 and 4 has to measure)
+{trained_md}{released_md}## Low precision (descriptive only; this is what the precision study in Milestones 2 and 4 has to measure)
 
 {md_table(sixteen, sixteen_cols)}
 
@@ -568,7 +655,7 @@ kept in float32. It says the precision study is worth running; it does not say w
 ## Scope and limits
 
 {KERNEL_SCOPE_TESTED if kernels_md else KERNEL_SCOPE_UNTESTED}
-{"- **Mostly random initialisation.** The main tables use a seeded initialisation. The test was repeated on two small trained models (section above) with the same outcome; it has not been run on a large or publicly released checkpoint." if trained_md else "- **Random initialisation.** The checkpoint is a seeded initialisation, not a trained model. Whether chunk length changes the function does not depend on the weights for the mechanisms above, but the *size* of the rounding deviation does (gates near one, long effective memory). Repeat on a trained checkpoint before quoting magnitudes."}
+{"- **Mostly random initialisation.** The main tables use a seeded initialisation. The test was repeated on two small trained models and on three publicly released checkpoints (sections above) with the same outcome for the scheduling class. No released checkpoint of an architectural-class model was tested." if trained_md else "- **Random initialisation.** The checkpoint is a seeded initialisation, not a trained model. Whether chunk length changes the function does not depend on the weights for the mechanisms above, but the *size* of the rounding deviation does (gates near one, long effective memory). Repeat on a trained checkpoint before quoting magnitudes."}
 - **HLA is written from the method section of the paper**, not from released code, and is labelled
   HLA-style. The inference-time gate threshold and the training regulariser are not part of the test.
 - **FLASH** follows the paper's pseudo-code with one substitution: a fixed-size table of relative-position
@@ -596,7 +683,9 @@ def main() -> int:
     kernels_md = kernel_section(pd.read_csv(kernel_csv)) if kernel_csv.exists() else ""
     trained_csv = RESULTS / "equivalence_trained.csv"
     trained_md = trained_section(pd.read_csv(trained_csv)) if trained_csv.exists() else ""
-    (DOCS / "classification.md").write_text(document(frame, summary, lines, passed, kernels_md, trained_md))
+    released_csv = RESULTS / "equivalence_released.csv"
+    released_md = released_section(pd.read_csv(released_csv)) if released_csv.exists() else ""
+    (DOCS / "classification.md").write_text(document(frame, summary, lines, passed, kernels_md, trained_md, released_md))
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(summary[["tier", "architecture", "fwd_dev_float32", "fwd_dev_float64", "grad_dev_float64",
                        "verdict", "classification"]].to_string(index=False, float_format=lambda v: f"{v:.2e}"))

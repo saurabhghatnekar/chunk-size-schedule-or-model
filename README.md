@@ -57,8 +57,8 @@ Controls, all passing on CPU:
 Limits, stated once here and in full in the classification document:
 
 - The main tables use seeded random initialisations of a tiny model. The test was repeated on two small
-  trained models (about 5M parameters) with the same outcome; it has not been run on a large or publicly
-  released checkpoint.
+  trained models (about 5M parameters) and on three publicly released checkpoints, with the same outcome
+  for the scheduling class. No released checkpoint of an architectural-class model was tested.
 - The reference layers were written for this project from the papers. HLA is written from the method section
   of its paper, not from released code.
 - The mechanism statements are checked numerically. The chunkwise derivations have not yet been redone by hand.
@@ -72,6 +72,24 @@ trained Gated DeltaNet model agrees across chunk lengths to 3e-14 in float64 and
 the trained LaCT model differs by 0.02 to 0.17 at both precisions (architectural). On a GPU with the same
 trained weights, the library's Gated DeltaNet kernel is about 1e-3 from the float64 recurrence under the TF32
 default, 2e-6 with IEEE dot products, and 7e-3 to 9e-3 in bfloat16.
+
+## The same test on publicly released checkpoints
+
+Three released models, run through their authors' own kernels on real text: `state-spaces/mamba2-130m` with
+the official `mamba_ssm` kernels, and `fla-hub/delta_net-1.3B-100B` and `fla-hub/gla-340M-15B` with
+flash-linear-attention's. Each layer's kernel was also replayed on the activations it actually received,
+against the float64 token-by-token recurrence.
+
+| Released model | float32, Triton default | float32, IEEE | bfloat16 |
+|---|---|---|---|
+| Mamba-2 130M, one kernel call | 1.6e-03 from the recurrence | 4e-07 to 2e-05 | at the quantisation floor |
+| Mamba-2 130M, whole model across chunk sizes | logits move up to 4e-03 | up to 6e-04 | up to 0.11; top token changes at up to 3.4% of positions |
+| GLA 340M, whole model, chunked against recurrent | 8e-04 | 1e-06 | 9e-03; top token changes at 0.9% of positions |
+| DeltaNet 1.3B, whole model, chunked against recurrent | kernel refuses float32 | kernel refuses float32 | up to 0.026; top token changes at 0.9% of positions |
+
+So with real weights these three are scheduling-class, the TF32 gap is present in Mamba-2's official kernels
+as well, and in bfloat16 the per-kernel rounding compounds across layers into visible changes in the model's
+predictions when only the chunk size changes.
 
 ## The same test on code other people ship
 
@@ -189,6 +207,7 @@ The kernel tier needs a CUDA GPU. It is set up for [Modal](https://modal.com):
 
 ```bash
 uv run modal run modal_app.py                                  # every kernel, default GPU
+uv run modal run modal_released.py                             # three released checkpoints
 CHUNK_GPU=H100 uv run modal run modal_app.py                   # another GPU; rows are keyed by GPU model
 CHUNK_TRITON_F32=ieee uv run modal run modal_app.py --only fla_chunk_simple_gla,fla_chunk_gla,fla_chunk_gated_delta_rule --dtype float32
 ```
@@ -207,6 +226,7 @@ The last line is the ablation behind point 2 above; its rows are in `results/equ
 | `src/equivalence/archs/` | dtype-generic reference layers, chunk length as a call-time argument |
 | `src/equivalence/library/` | the test applied to pinned pure-PyTorch third-party ops |
 | `src/equivalence/kernels/` | the test applied to Triton kernels, with float64 oracles |
+| `src/equivalence/released.py`, `modal_released.py` | the test on publicly released checkpoints through their authors' kernels |
 | `modal_app.py` | runs the kernel tier on a Modal GPU, one isolated container per unit |
 | `tests/theory/` | numerical checks of each proposition; `tests/unit/` checks the harness |
 | `checkpoints/` | the fixed weights and batch (seeded, saved once, hashed in the CSV) |
@@ -232,9 +252,8 @@ The last line is the ablation behind point 2 above; its rows are in `results/equ
 The plan itself ("the roadmap" in the documents here) is a separate document and is not part of this
 repository.
 
-Open items for Milestone 1: derive the chunkwise forms by hand; run the test on a large or publicly released
-checkpoint; test the official Mamba-2 kernels; write the paragraph on why the HLA and FLASH ablations do not
-transfer to an exact kernel.
+Open items for Milestone 1: derive the chunkwise forms by hand; write the paragraph on why the HLA and FLASH
+ablations do not transfer to an exact kernel; run the test on a released architectural-class model.
 
 ## Acknowledgements and licences
 

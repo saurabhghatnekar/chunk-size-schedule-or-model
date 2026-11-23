@@ -385,6 +385,56 @@ reference" shows how closely the shipped op follows its own definition:
 | gated_deltanet (trained byte-level model, fla kernel) | fp32_ieee | 32 | 1.6e-06 | 1.7e-06 | 1.2e-06 |
 | gated_deltanet (trained byte-level model, fla kernel) | fp32_ieee | 64 | 2.1e-06 | 1.8e-06 | 1.7e-06 |
 
+## Result: publicly released checkpoints, through their authors' kernels
+
+The same question asked of models other people trained and released, run through the code they ship:
+`state-spaces/mamba2-130m` with the official `mamba_ssm` kernels, and `fla-hub/delta_net-1.3B-100B` and
+`fla-hub/gla-340M-15B` with flash-linear-attention's kernels. The input is two windows of 1024 tokens of
+real text, tokenised with each model's own tokenizer. NVIDIA A10, torch 2.15.0+cu132, triton 3.9.0,
+sources fla@cc4648a mamba@e9594ce.
+
+**Whole model.** The logits at each chunk size (or kernel variant) against a reference configuration: the
+recurrent kernel where the library has one, the default chunk size otherwise. Top-1 agreement is the fraction
+of the 2048 positions where the highest-scoring next token is the same.
+
+| Released model | Code | Arithmetic | Compared with | Chunk sizes | Largest logit deviation | Lowest top-1 agreement |
+|---|---|---|---|---|---|---|
+| `state-spaces/mamba2-130m` | mamba_ssm official kernels | float32, Triton default (TF32) | chunk 256 | 16 32 64 128 512 1024 | 4.2e-03 | 0.9995 |
+| `state-spaces/mamba2-130m` | mamba_ssm official kernels | float32, IEEE dot products | chunk 256 | 16 32 64 128 512 1024 | 5.8e-04 | 1.0000 |
+| `state-spaces/mamba2-130m` | mamba_ssm official kernels | bfloat16 autocast | chunk 256 | 16 32 64 128 512 1024 | 1.1e-01 | 0.9663 |
+| `fla-hub/delta_net-1.3B-100B` | flash-linear-attention DeltaNet kernels | bfloat16 autocast | fused_recurrent | 16 32 64 | 2.6e-02 | 0.9907 |
+| `fla-hub/gla-340M-15B` | flash-linear-attention GLA kernels | float32, Triton default (TF32) | fused_recurrent | 64 | 8.2e-04 | 1.0000 |
+| `fla-hub/gla-340M-15B` | flash-linear-attention GLA kernels | float32, IEEE dot products | fused_recurrent | 64 | 1.4e-06 | 1.0000 |
+| `fla-hub/gla-340M-15B` | flash-linear-attention GLA kernels | bfloat16 autocast | fused_recurrent | 64 | 8.7e-03 | 0.9907 |
+
+Refused: `fla-hub/delta_net-1.3B-100B` chunk in fp32: AssertionError: ChunkDeltaRuleFunction does not support float32. Please use bfloat16..
+
+**One kernel call, real activations.** The inputs that the first, middle and last layer actually hand to their
+kernel are captured during a forward pass and the kernel is replayed on them, against the float64
+token-by-token recurrence. Worst over the three layers and over the chunk sizes listed:
+
+| Released model | Arithmetic | Kernel variant | Layers | Dev. from float64 recurrence, outputs | Same, gradients | Quantisation floor |
+|---|---|---|---|---|---|---|
+| `state-spaces/mamba2-130m` | float32, Triton default (TF32) | chunk (16 64 256 1024) | 3 | 1.6e-03 | 1.6e-03 | 3.5e-08 |
+| `state-spaces/mamba2-130m` | float32, IEEE dot products | chunk (16 64 256 1024) | 3 | 1.7e-05 | 9.1e-06 | 3.1e-08 |
+| `state-spaces/mamba2-130m` | bfloat16 autocast | chunk (16 64 256 1024) | 3 | 3.5e-03 | 3.8e-03 | 3.1e-03 |
+| `fla-hub/delta_net-1.3B-100B` | bfloat16 autocast | fused_recurrent (1) | 3 | 5.9e-03 | 1.2e-02 | 3.0e-03 |
+| `fla-hub/delta_net-1.3B-100B` | bfloat16 autocast | chunk (16 32 64) | 3 | 6.3e-03 | 5.2e-02 | 3.0e-03 |
+| `fla-hub/gla-340M-15B` | float32, Triton default (TF32) | fused_recurrent (1) | 3 | 2.6e-06 | 4.3e-06 | 5.6e-08 |
+| `fla-hub/gla-340M-15B` | float32, Triton default (TF32) | chunk (size fixed by the kernel) (64) | 3 | 1.2e-03 | 1.4e-03 | 5.6e-08 |
+| `fla-hub/gla-340M-15B` | float32, IEEE dot products | fused_recurrent (1) | 3 | 2.7e-06 | 4.2e-06 | 5.2e-08 |
+| `fla-hub/gla-340M-15B` | float32, IEEE dot products | chunk (size fixed by the kernel) (64) | 3 | 6.2e-06 | 5.4e-06 | 5.2e-08 |
+| `fla-hub/gla-340M-15B` | bfloat16 autocast | fused_recurrent (1) | 3 | 3.0e-03 | 3.7e-03 | 3.0e-03 |
+| `fla-hub/gla-340M-15B` | bfloat16 autocast | chunk (size fixed by the kernel) (64) | 3 | 3.8e-03 | 5.0e-03 | 3.0e-03 |
+
+What this shows:
+
+- **Mamba-2 and GLA are scheduling-class with real weights.** With IEEE dot products their chunked kernels reproduce the token-by-token recurrence on real activations to between 9.9e-08 and 1.7e-05, at every chunk size tested.
+- **DeltaNet can only be checked in bfloat16**, because its chunked kernel refuses float32. There its outputs are within about 2 quantisation floors of the recurrence at chunk 16, 32 and 64. Its gradients drift further as the chunk grows: 1.3e-02 at chunk 16, 2.4e-02 at chunk 32, 5.2e-02 at chunk 64.
+- **The TF32 gap is in Mamba-2's official kernels as well.** With Triton's default the chunked kernels are between 8.7e-04 and 1.6e-03 from the recurrence on released weights, in both libraries.
+- **In bfloat16 each kernel call sits near the quantisation floor, but the model does not.** Across 24 layers the rounding compounds: changing only the chunk size or kernel variant moves the logits by 7.6e-03 to 1.1e-01 of their scale and changes the top-scoring token at 0.8% to 3.4% of positions. This is sensitivity to rounding, with the chunk size as the perturbation; it was not compared with any other perturbation of the same size.
+- **Rounding grows with the chunk.** Under IEEE float32 the Mamba-2 kernel is 3.7e-07 from the recurrence at chunk 16 and 1.7e-05 at chunk 1024.
+
 ## Low precision (descriptive only; this is what the precision study in Milestones 2 and 4 has to measure)
 
 | Architecture | Class | Output dev. bfloat16 | Output dev. float16 | Output dev. float32 |
@@ -447,9 +497,9 @@ The float16 backward pass is non-finite at every chunk length, the reference one
 
 - **Implementations, not architectures in general.** The reference tier is code written for this project
   from the papers. The library and kernel tiers cover the pinned commits of flash-linear-attention and LaCT
-  on the GPUs named above, with `torch.compile` disabled. The official Mamba-2 kernels (`mamba_ssm`) are not
-  covered; `chunk_simple_gla` is the same scalar-decay recurrence but a different kernel.
-- **Mostly random initialisation.** The main tables use a seeded initialisation. The test was repeated on two small trained models (section above) with the same outcome; it has not been run on a large or publicly released checkpoint.
+  on the GPUs named above, with `torch.compile` disabled. The official Mamba-2 kernels (`mamba_ssm`) are
+  covered in the released-checkpoint section, through their plain path and not their fused one.
+- **Mostly random initialisation.** The main tables use a seeded initialisation. The test was repeated on two small trained models and on three publicly released checkpoints (sections above) with the same outcome for the scheduling class. No released checkpoint of an architectural-class model was tested.
 - **HLA is written from the method section of the paper**, not from released code, and is labelled
   HLA-style. The inference-time gate threshold and the training regulariser are not part of the test.
 - **FLASH** follows the paper's pseudo-code with one substitution: a fixed-size table of relative-position

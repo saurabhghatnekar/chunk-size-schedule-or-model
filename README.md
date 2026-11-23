@@ -91,6 +91,12 @@ So with real weights these three are scheduling-class, the TF32 gap is present i
 as well, and in bfloat16 the per-kernel rounding compounds across layers into visible changes in the model's
 predictions when only the chunk size changes.
 
+**That bfloat16 effect is ordinary rounding noise, not something special about chunking.** In a control, the
+chunk size was held fixed and a random perturbation with the same per-element sizes was injected at every
+layer in place of the real chunk-size difference. It changed the top-scoring token about as often as the real
+chunk change (Mamba-2: 2.3% to 3.1% against 2.2% to 3.0%). Running in bfloat16 instead of float32 with the
+chunk held fixed changed more (4.4%), and the same configuration run twice changed nothing.
+
 ## The same test on code other people ship
 
 **Pure-PyTorch reference ops** in flash-linear-attention and LaCT (pinned commits, CPU) give the same split:

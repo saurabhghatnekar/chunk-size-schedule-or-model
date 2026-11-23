@@ -303,3 +303,166 @@ def gla(arithmetic: str, repo: str = "fla-hub/gla-340M-15B") -> list[dict]:
 
 
 RUNNERS = {"mamba2": mamba2, "delta_net": delta_net, "gla": gla}
+
+
+# ---- bfloat16 control: is the effect of changing the chunk size special, or ordinary rounding noise? ----
+#
+# Hold the reference configuration fixed (chunk 256 for Mamba-2, the recurrent kernel for the fla models).
+# At every layer, compute on the same inputs what the kernel would have returned at the other chunk size;
+# the difference `delta` is exactly what switching chunk size changes at that layer. Then return, instead:
+#
+#   exact      reference + delta                 this is the chunk-size change itself (and is checked against it)
+#   signflip   reference + delta * random signs  same per-element sizes, direction randomised
+#   gaussian   reference + noise                 same root-mean-square size per layer, independent noise
+#
+# plus two yardsticks: the reference configuration run a second time, and bfloat16 against float32 with
+# the chunk size held fixed.
+
+def _perturb(mode: str, ref: torch.Tensor, other: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
+    if mode == "exact":
+        return other
+    delta = other.float() - ref.float()
+    if mode == "signflip":
+        sign = (torch.rand(delta.shape, generator=gen, device=delta.device) < 0.5).float() * 2 - 1
+        return (ref.float() + delta * sign).to(ref.dtype)
+    if mode == "gaussian":
+        noise = torch.randn(delta.shape, generator=gen, device=delta.device) * delta.pow(2).mean().sqrt()
+        return (ref.float() + noise).to(ref.dtype)
+    raise ValueError(mode)
+
+
+def _control_rows(base: dict, chunks: tuple, state: dict, logits, true_chunk_logits) -> list[dict]:
+    """`logits(bf16)` runs the model with the wrapper in whatever mode `state` says."""
+    rows = []
+
+    def row(condition, chunk, seed, out, ref):
+        dev = deviation(ref, out)
+        entry = {**base, "level": "control", "condition": condition, "chunk": chunk, "seed": seed, "status": "ok",
+                 "fwd_max_rel": dev["max_rel"], "fwd_l2_rel": dev["l2_rel"],
+                 "top1_changed": 1.0 - (out.argmax(-1) == ref.argmax(-1)).float().mean().item()}
+        rows.append(entry)
+        print(f"  control {condition:44s} chunk {chunk!s:>5} seed {seed!s:>4}  l2 {dev['l2_rel']:.2e}  max {dev['max_rel']:.2e}  "
+              f"top-1 changed {100 * entry['top1_changed']:.2f}%", flush=True)
+
+    state.update(mode="none")
+    ref_bf16 = logits(True)
+    row("same configuration run again", state["ref_label"], None, logits(True), ref_bf16)
+    ref_fp32 = logits(False)
+    row("bfloat16 against float32, chunk size held fixed", state["ref_label"], None, ref_bf16, ref_fp32)
+    for c in chunks:
+        state.update(mode="exact", c=c)
+        changed = logits(True)
+        row("chunk size changed", c, None, changed, ref_bf16)
+        row("check: injected difference equals the real change", c, None, changed, true_chunk_logits(c))
+        for mode, label in (("signflip", "same sizes, random signs"), ("gaussian", "same RMS, independent noise")):
+            for seed in range(3):
+                state.update(mode=mode, c=c, gen=torch.Generator(device="cuda").manual_seed(100 + seed))
+                row(f"random perturbation: {label}", c, seed, logits(True), ref_bf16)
+    state.update(mode="none")
+    return rows
+
+
+def control_mamba2(arithmetic: str, repo: str = "state-spaces/mamba2-130m", source: str = "/opt/third_party/mamba") -> list[dict]:
+    import json
+    import types
+
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+
+    sys.path.insert(0, source)
+    sys.modules.setdefault("mamba_ssm.utils.hf", types.SimpleNamespace(load_config_hf=None, load_state_dict_hf=None))
+    import mamba_ssm.modules.mamba2 as mamba2_module
+    from mamba_ssm.models.config_mamba import MambaConfig
+    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
+    base = {**_environment(arithmetic), "model": repo, "implementation": "mamba_ssm official kernels"}
+    model = MambaLMHeadModel(MambaConfig(**json.load(open(hf_hub_download(repo, "config.json")))), device="cuda", dtype=torch.float32)
+    model.load_state_dict(torch.load(hf_hub_download(repo, "pytorch_model.bin"), map_location="cuda", weights_only=True))
+    model.eval()
+    ids = text_batch(AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b"))
+    mixers = [layer.mixer for layer in model.backbone.layers]
+    for m in mixers:
+        m.use_mem_eff_path = False
+    kernel = mamba2_module.mamba_chunk_scan_combined
+    state = {"mode": "none", "c": 256, "gen": None, "ref_label": 256}
+
+    def wrapper(x, dt, A, B, C, chunk_size, **kw):
+        ref = kernel(x, dt, A, B, C, chunk_size=256, **kw)
+        if state["mode"] == "none":
+            return ref
+        return _perturb(state["mode"], ref, kernel(x, dt, A, B, C, chunk_size=state["c"], **kw), state["gen"])
+
+    def logits(bf16: bool):
+        mamba2_module.mamba_chunk_scan_combined = wrapper
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            return model(ids).logits.float().cpu()
+
+    def true_chunk_logits(c: int):
+        mamba2_module.mamba_chunk_scan_combined = kernel
+        for m in mixers:
+            m.chunk_size = c
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            return model(ids).logits.float().cpu()
+
+    return _control_rows(base, (16, 64, 1024), state, logits, true_chunk_logits)
+
+
+def _control_fla(base: dict, model, ids, layers, layer_module, rec_name: str, chunk_name: str, chunk_call, chunks: tuple) -> list[dict]:
+    rec_kernel, chunk_kernel = getattr(layer_module, rec_name), getattr(layer_module, chunk_name)
+    state = {"mode": "none", "c": chunks[0], "gen": None, "ref_label": "recurrent"}
+
+    def wrapper(**kw):
+        ref, recurrent_state = rec_kernel(**kw)
+        if state["mode"] == "none":
+            return ref, recurrent_state
+        return _perturb(state["mode"], ref, chunk_call(chunk_kernel, kw, state["c"]), state["gen"]), recurrent_state
+
+    def logits(bf16: bool):
+        setattr(layer_module, rec_name, wrapper)
+        for m in layers:
+            m.mode = "fused_recurrent"
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            return model(ids).logits.float().cpu()
+
+    def true_chunk_logits(c):
+        setattr(layer_module, rec_name, rec_kernel)
+        setattr(layer_module, chunk_name, functools.partial(chunk_kernel, chunk_size=c) if c else chunk_kernel)
+        for m in layers:
+            m.mode = "chunk"
+        try:
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                return model(ids).logits.float().cpu()
+        finally:
+            setattr(layer_module, chunk_name, chunk_kernel)
+
+    return _control_rows(base, chunks, state, logits, true_chunk_logits)
+
+
+def control_delta_net(arithmetic: str, repo: str = "fla-hub/delta_net-1.3B-100B") -> list[dict]:
+    import fla.layers.delta_net as layer_module
+    from fla.layers.delta_net import DeltaNet
+
+    base = {**_environment(arithmetic), "model": repo, "implementation": "flash-linear-attention DeltaNet kernels"}
+    model, ids = _fla_model(repo)
+    layers = [m for m in model.modules() if isinstance(m, DeltaNet)]
+    call = lambda kernel, kw, c: kernel(q=kw["q"], k=kw["k"], v=kw["v"], beta=kw["beta"],
+                                        use_qk_l2norm_in_kernel=kw["use_qk_l2norm_in_kernel"], chunk_size=c)[0]
+    return _control_fla(base, model, ids, layers, layer_module, "fused_recurrent_delta_rule", "chunk_delta_rule", call, (16, 64))
+
+
+def control_gla(arithmetic: str, repo: str = "fla-hub/gla-340M-15B") -> list[dict]:
+    import fla.layers.gla as layer_module
+    from fla.layers.gla import GatedLinearAttention
+
+    base = {**_environment(arithmetic), "model": repo, "implementation": "flash-linear-attention GLA kernels"}
+    model, ids = _fla_model(repo)
+    layers = [m for m in model.modules() if isinstance(m, GatedLinearAttention)]
+    call = lambda kernel, kw, c: kernel(q=kw["q"], k=kw["k"], v=kw["v"], g=kw["gk"])[0]
+    rows = _control_fla(base, model, ids, layers, layer_module, "fused_recurrent_gla", "chunk_gla", call, (0,))
+    for r in rows:  # this kernel fixes its own chunk size
+        if r["chunk"] == 0:
+            r["chunk"] = 64
+    return rows
+
+
+CONTROLS = {"mamba2": control_mamba2, "delta_net": control_delta_net, "gla": control_gla}

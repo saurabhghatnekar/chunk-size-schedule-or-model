@@ -250,8 +250,8 @@ def released_section(frame: pd.DataFrame) -> str:
         f"- **In bfloat16 each kernel call sits near the quantisation floor, but the model does not.** Across 24 layers the "
         f"rounding compounds: changing only the chunk size or kernel variant moves the logits by {fmt(bf['fwd_max_rel'].min())} to "
         f"{fmt(bf['fwd_max_rel'].max())} of their scale and changes the top-scoring token at {100 * (1 - bf['top1_agreement'].max()):.1f}% to "
-        f"{100 * (1 - bf['top1_agreement'].min()):.1f}% of positions. This is sensitivity to rounding, with the chunk size as the "
-        f"perturbation; it was not compared with any other perturbation of the same size.",
+        f"{100 * (1 - bf['top1_agreement'].min()):.1f}% of positions. The control below shows this is ordinary bfloat16 "
+        f"rounding and not something specific to chunking.",
         f"- **Rounding grows with the chunk.** Under IEEE float32 the Mamba-2 kernel is {fmt(m_ieee.iloc[0])} from the recurrence at "
         f"chunk {int(m_ieee.index[0])} and {fmt(m_ieee.iloc[-1])} at chunk {int(m_ieee.index[-1])}." if len(m_ieee) else "",
     ]
@@ -279,6 +279,64 @@ token-by-token recurrence. Worst over the three layers and over the chunk sizes 
 What this shows:
 
 {chr(10).join(points)}
+
+"""
+
+
+def control_section(frame: pd.DataFrame) -> str:
+    """The bfloat16 control, from results/bf16_control.csv."""
+    ok = frame[frame["status"].astype(str) == "ok"]
+    pct = lambda lo, hi: f"{100 * lo:.2f}%" if abs(hi - lo) < 5e-5 else f"{100 * lo:.2f}% to {100 * hi:.2f}%"
+    rng = lambda lo, hi: fmt(lo) if lo == hi else f"{fmt(lo)} to {fmt(hi)}"
+    order = ["same configuration run again", "bfloat16 against float32, chunk size held fixed", "chunk size changed",
+             "random perturbation: same sizes, random signs", "random perturbation: same RMS, independent noise"]
+    names = {"same configuration run again": "Same configuration run again",
+             "bfloat16 against float32, chunk size held fixed": "bfloat16 against float32, chunk held fixed",
+             "chunk size changed": "Chunk size changed (or chunked kernel in place of recurrent)",
+             "random perturbation: same sizes, random signs": "Random perturbation, same per-element sizes, random signs",
+             "random perturbation: same RMS, independent noise": "Random perturbation, same RMS per layer, independent noise"}
+    lines = ["| Released model | Condition | Runs | Logit change (relative L2) | Top-scoring token changed |", "|---|---|---|---|---|"]
+    verdicts = []
+    for case, g in ok.groupby("model", sort=False):
+        for cond in order:
+            c = g[g["condition"] == cond]
+            if len(c):
+                lines.append(f"| `{case}` | {names[cond]} | {len(c)} | {rng(c['fwd_l2_rel'].min(), c['fwd_l2_rel'].max())} | "
+                             f"{pct(c['top1_changed'].min(), c['top1_changed'].max())} |")
+        real, rand = g[g["condition"] == order[2]], g[g["condition"] == order[3]]
+        prec = g[g["condition"] == order[1]]
+        if len(real) and len(rand) and len(prec):
+            verdicts.append(f"`{case}`: chunk change {pct(real['top1_changed'].min(), real['top1_changed'].max())}, "
+                            f"sign-randomised perturbation {pct(rand['top1_changed'].min(), rand['top1_changed'].max())}, "
+                            f"bfloat16 against float32 {pct(prec['top1_changed'].min(), prec['top1_changed'].max())}")
+    check = ok[ok["condition"].str.startswith("check")]
+    return f"""### Control: is changing the chunk size special, or ordinary bfloat16 noise?
+
+The reference configuration is held fixed (chunk 256 for Mamba-2, the recurrent kernel for the other two).
+At every layer the kernel is also evaluated, on the same inputs, as it would be at the other chunk size; the
+difference is exactly what switching chunk size changes at that layer. A random perturbation with the same
+per-element sizes but random signs is then injected in its place, and separately independent noise with the
+same root-mean-square size per layer. Two yardsticks are measured as well: the identical configuration run
+twice, and bfloat16 against float32 with the chunk held fixed. Injecting the true difference reproduces the
+real chunk change exactly (largest discrepancy over {len(check)} checks: {fmt(check['fwd_max_rel'].max())}).
+
+{chr(10).join(lines)}
+
+Top-scoring token changed, side by side. {"; ".join(verdicts)}.
+
+- **Changing the chunk size is not special.** A random perturbation of the same per-element sizes moves the
+  logits and changes the top-scoring token about as much as the real chunk change does, in all three models.
+- **It is no larger than the cost of bfloat16 itself.** Running in bfloat16 instead of float32, with the chunk
+  held fixed, changes at least as many top-scoring tokens as changing the chunk size within bfloat16.
+- **It is not run-to-run noise.** The same configuration run twice gives identical logits.
+- **The kernels' rounding is more benign than independent noise of the same overall size.** Independent noise
+  with the same RMS changes more predictions in two of the three models, because the kernels' differences
+  scale with each element's magnitude and independent noise does not.
+
+So the right reading of the bfloat16 numbers above is: in bfloat16 these models are sensitive to rounding at
+the level of one to a few percent of top-scoring tokens, and the chunk size is one of the things that selects
+which rounding happens. Exact figures move a little between runs on fresh containers, because Triton's
+autotuner may pick a different kernel configuration.
 
 """
 
@@ -685,6 +743,9 @@ def main() -> int:
     trained_md = trained_section(pd.read_csv(trained_csv)) if trained_csv.exists() else ""
     released_csv = RESULTS / "equivalence_released.csv"
     released_md = released_section(pd.read_csv(released_csv)) if released_csv.exists() else ""
+    control_csv = RESULTS / "bf16_control.csv"
+    if released_md and control_csv.exists():
+        released_md += control_section(pd.read_csv(control_csv))
     (DOCS / "classification.md").write_text(document(frame, summary, lines, passed, kernels_md, trained_md, released_md))
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(summary[["tier", "architecture", "fwd_dev_float32", "fwd_dev_float64", "grad_dev_float64",

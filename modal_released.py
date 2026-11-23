@@ -55,6 +55,44 @@ def released_run(name: str, arithmetic: str) -> list[dict]:
     return [{**row, "case": name, "sources": f"fla@{FLA[1][:7]} mamba@{MAMBA[1][:7]}"} for row in rows]
 
 
+@app.function(gpu=GPU, cpu=8.0, memory=32768, timeout=TIMEOUT, max_containers=10, single_use_containers=True)
+def released_control(name: str) -> list[dict]:
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"  # the float32 yardstick should be real float32
+    from src.equivalence.released import CONTROLS
+
+    rows = CONTROLS[name]("ieee")
+    return [{**row, "case": name, "sources": f"fla@{FLA[1][:7]} mamba@{MAMBA[1][:7]}"} for row in rows]
+
+
+@app.local_entrypoint()
+def control(only: str = ""):
+    """The bfloat16 control: is changing the chunk size special, or ordinary rounding noise?
+
+        uv run modal run modal_released.py::control
+    """
+    import datetime as dt
+
+    import pandas as pd
+
+    names = [n for n in ("mamba2", "gla", "delta_net") if not only or n in only.split(",")]
+    out = Path(__file__).resolve().parent / "results" / "bf16_control.csv"
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    frame = pd.read_csv(out) if out.exists() else pd.DataFrame()
+    if len(frame):
+        frame = frame[~frame["case"].isin(names)]
+    for name, call in [(n, released_control.spawn(n)) for n in names]:
+        try:
+            rows = call.get()
+            print(f"  returned {name}: {len(rows)} rows", flush=True)
+        except Exception as exc:
+            text = str(exc).strip().splitlines()[0][:200] if str(exc).strip() else ""
+            print(f"  FAILED {name}: {type(exc).__name__}: {text}", flush=True)
+            rows = [{"case": name, "status": f"error: {type(exc).__name__}: {text}"}]
+        frame = pd.concat([frame, pd.DataFrame(rows).assign(run_utc=stamp)], ignore_index=True)
+        frame.to_csv(out, index=False)
+    print(f"wrote {out}")
+
+
 @app.local_entrypoint()
 def main(only: str = ""):
     import datetime as dt

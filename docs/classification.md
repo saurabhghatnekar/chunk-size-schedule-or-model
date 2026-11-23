@@ -432,8 +432,52 @@ What this shows:
 - **Mamba-2 and GLA are scheduling-class with real weights.** With IEEE dot products their chunked kernels reproduce the token-by-token recurrence on real activations to between 9.9e-08 and 1.7e-05, at every chunk size tested.
 - **DeltaNet can only be checked in bfloat16**, because its chunked kernel refuses float32. There its outputs are within about 2 quantisation floors of the recurrence at chunk 16, 32 and 64. Its gradients drift further as the chunk grows: 1.3e-02 at chunk 16, 2.4e-02 at chunk 32, 5.2e-02 at chunk 64.
 - **The TF32 gap is in Mamba-2's official kernels as well.** With Triton's default the chunked kernels are between 8.7e-04 and 1.6e-03 from the recurrence on released weights, in both libraries.
-- **In bfloat16 each kernel call sits near the quantisation floor, but the model does not.** Across 24 layers the rounding compounds: changing only the chunk size or kernel variant moves the logits by 7.6e-03 to 1.1e-01 of their scale and changes the top-scoring token at 0.8% to 3.4% of positions. This is sensitivity to rounding, with the chunk size as the perturbation; it was not compared with any other perturbation of the same size.
+- **In bfloat16 each kernel call sits near the quantisation floor, but the model does not.** Across 24 layers the rounding compounds: changing only the chunk size or kernel variant moves the logits by 7.6e-03 to 1.1e-01 of their scale and changes the top-scoring token at 0.8% to 3.4% of positions. The control below shows this is ordinary bfloat16 rounding and not something specific to chunking.
 - **Rounding grows with the chunk.** Under IEEE float32 the Mamba-2 kernel is 3.7e-07 from the recurrence at chunk 16 and 1.7e-05 at chunk 1024.
+
+### Control: is changing the chunk size special, or ordinary bfloat16 noise?
+
+The reference configuration is held fixed (chunk 256 for Mamba-2, the recurrent kernel for the other two).
+At every layer the kernel is also evaluated, on the same inputs, as it would be at the other chunk size; the
+difference is exactly what switching chunk size changes at that layer. A random perturbation with the same
+per-element sizes but random signs is then injected in its place, and separately independent noise with the
+same root-mean-square size per layer. Two yardsticks are measured as well: the identical configuration run
+twice, and bfloat16 against float32 with the chunk held fixed. Injecting the true difference reproduces the
+real chunk change exactly (largest discrepancy over 6 checks: 0 (identical)).
+
+| Released model | Condition | Runs | Logit change (relative L2) | Top-scoring token changed |
+|---|---|---|---|---|
+| `state-spaces/mamba2-130m` | Same configuration run again | 1 | 0 (identical) | 0.00% |
+| `state-spaces/mamba2-130m` | bfloat16 against float32, chunk held fixed | 1 | 1.6e-02 | 4.44% |
+| `state-spaces/mamba2-130m` | Chunk size changed (or chunked kernel in place of recurrent) | 3 | 1.4e-02 to 1.5e-02 | 2.15% to 2.98% |
+| `state-spaces/mamba2-130m` | Random perturbation, same per-element sizes, random signs | 9 | 1.3e-02 to 1.7e-02 | 2.29% to 3.08% |
+| `state-spaces/mamba2-130m` | Random perturbation, same RMS per layer, independent noise | 9 | 1.8e-02 to 3.0e-02 | 2.39% to 3.32% |
+| `fla-hub/gla-340M-15B` | Same configuration run again | 1 | 0 (identical) | 0.00% |
+| `fla-hub/gla-340M-15B` | bfloat16 against float32, chunk held fixed | 1 | 3.0e-03 | 0.83% |
+| `fla-hub/gla-340M-15B` | Chunk size changed (or chunked kernel in place of recurrent) | 1 | 3.9e-03 | 0.78% |
+| `fla-hub/gla-340M-15B` | Random perturbation, same per-element sizes, random signs | 3 | 4.0e-03 to 4.0e-03 | 0.54% to 0.73% |
+| `fla-hub/gla-340M-15B` | Random perturbation, same RMS per layer, independent noise | 3 | 4.2e-02 to 4.9e-02 | 3.91% to 4.35% |
+| `fla-hub/delta_net-1.3B-100B` | Same configuration run again | 1 | 0 (identical) | 0.00% |
+| `fla-hub/delta_net-1.3B-100B` | bfloat16 against float32, chunk held fixed | 1 | 1.4e-02 | 1.61% |
+| `fla-hub/delta_net-1.3B-100B` | Chunk size changed (or chunked kernel in place of recurrent) | 2 | 1.3e-02 to 1.8e-02 | 0.83% to 0.93% |
+| `fla-hub/delta_net-1.3B-100B` | Random perturbation, same per-element sizes, random signs | 6 | 1.3e-02 to 1.9e-02 | 0.78% to 1.07% |
+| `fla-hub/delta_net-1.3B-100B` | Random perturbation, same RMS per layer, independent noise | 6 | 4.0e-02 to 7.5e-02 | 1.61% to 1.90% |
+
+Top-scoring token changed, side by side. `state-spaces/mamba2-130m`: chunk change 2.15% to 2.98%, sign-randomised perturbation 2.29% to 3.08%, bfloat16 against float32 4.44%; `fla-hub/gla-340M-15B`: chunk change 0.78%, sign-randomised perturbation 0.54% to 0.73%, bfloat16 against float32 0.83%; `fla-hub/delta_net-1.3B-100B`: chunk change 0.83% to 0.93%, sign-randomised perturbation 0.78% to 1.07%, bfloat16 against float32 1.61%.
+
+- **Changing the chunk size is not special.** A random perturbation of the same per-element sizes moves the
+  logits and changes the top-scoring token about as much as the real chunk change does, in all three models.
+- **It is no larger than the cost of bfloat16 itself.** Running in bfloat16 instead of float32, with the chunk
+  held fixed, changes at least as many top-scoring tokens as changing the chunk size within bfloat16.
+- **It is not run-to-run noise.** The same configuration run twice gives identical logits.
+- **The kernels' rounding is more benign than independent noise of the same overall size.** Independent noise
+  with the same RMS changes more predictions in two of the three models, because the kernels' differences
+  scale with each element's magnitude and independent noise does not.
+
+So the right reading of the bfloat16 numbers above is: in bfloat16 these models are sensitive to rounding at
+the level of one to a few percent of top-scoring tokens, and the chunk size is one of the things that selects
+which rounding happens. Exact figures move a little between runs on fresh containers, because Triton's
+autotuner may pick a different kernel configuration.
 
 ## Low precision (descriptive only; this is what the precision study in Milestones 2 and 4 has to measure)
 

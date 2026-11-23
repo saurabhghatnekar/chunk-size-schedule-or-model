@@ -129,6 +129,13 @@ def test_hla_with_unit_routing_is_gated_deltanet_at_every_chunk_length(gen, chun
     assert deviation(gdn(x, 16), hla(x, chunk))["max_rel"] < TOL
 
 
+def test_hla_with_the_released_gate_bias_still_depends_on_the_chunk_boundary(gen):
+    # the authors' code adds 2.2 inside the routing sigmoid; gates move toward one but do not reach it
+    hla = HLAMixer(32, 2, pool_window=8, gate_bias=2.2).double()
+    x = torch.randn(2, 64, 32, generator=gen, dtype=torch.float64)
+    assert deviation(hla(x, 16), hla(x, 32))["max_rel"] > 1e-3
+
+
 def test_hla_single_chunk_is_gated_deltanet_and_routing_makes_the_boundary_matter(gen):
     hla, gdn = _hla_and_gdn(force_unit_routing=False)
     x = rand(gen, 2, T, 32)

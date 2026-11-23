@@ -29,7 +29,7 @@ ROADMAP = "roadmap description; paper not re-read for this sheet"
 LITERATURE = [
     # key, title, authors, year, arXiv, venue, role, chunk claim concerns, basis
     ("DeltaNet", "Parallelizing Linear Transformers with the Delta Rule over Sequence Length", "Yang et al.", 2024,
-     "2406.06484", "NeurIPS 2024", "Premise of the scheduling class; derive the chunkwise form by hand",
+     "2406.06484", "NeurIPS 2024", "Premise of the scheduling class; chunkwise form derived in the paper's appendix",
      "Scheduling: the chunkwise form is a re-association of the recurrence", TESTED),
     ("Gated DeltaNet", "Gated Delta Networks: Improving Mamba2 with Delta Rule", "Yang et al.", 2024,
      "2412.06464", "ICLR 2025", "Premise of the scheduling class", "Scheduling: re-association", TESTED),
@@ -59,8 +59,8 @@ LITERATURE = [
      "Architectural: chunk-level routing. Not evidence about an exact chunkwise kernel",
      TESTED + " (HLA-style layer written from the method section); ablation figures read from the arXiv HTML"),
     ("FLASH", "Transformer Quality in Linear Time", "Hua et al.", 2022, "2202.10447", "ICML 2022",
-     "Architectural-class evidence; chunk 512 beats 256 beyond 1024 context (Appendix C.3, per roadmap)",
-     "Architectural: quadratic attention within a chunk, linear across", TESTED + " (from the paper's pseudo-code)"),
+     "Architectural-class evidence; chunk 512 preferable to the default 256 beyond 1024 context (Section 4.4; trade-off figure in Appendix C.3)",
+     "Architectural: quadratic attention within a chunk, linear across", TESTED + " (from the paper's Code 8, checked against the listing)"),
     ("StateFlow", "StateFlow: Sequence Pipeline Parallelism for Long-Context Modeling with Linear Recurrence",
      "Zhao et al.", 2026, "2608.06838", "preprint", "Prior art that treats chunking as scheduling, correctly",
      "Scheduling: linear recurrence", ROADMAP),

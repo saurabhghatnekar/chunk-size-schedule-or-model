@@ -42,7 +42,7 @@ The same configuration and seed run twice:
 | bfloat16 autocast | 64 | 0 | 1.20436 1.20246 1.20620 (1 of 3 read from the run log, 4 d.p.) | 3.7e-03 | no |
 | float32, Triton default (TF32) | 64 | 0 | 1.20625 1.20491 1.20340 (1 of 3 read from the run log, 4 d.p.) | 2.8e-03 | no |
 
-Training with these kernels is not reproducible run to run: the same configuration and seed gives a final loss that differs by 2.8e-03 to 3.7e-03 nats. The largest chunk-length difference at a fixed seed is 1.9e-03 nats and the seed spread is 3.8e-03 to 4.2e-03. So a same-seed comparison between two chunk lengths is no tighter than a comparison between two reruns of one chunk length, and the chunk-length differences seen here are inside that floor.
+Training runs with these kernels did not reproduce across fresh containers (cause not isolated; Triton's autotuner choosing a different kernel configuration is a candidate): the same configuration and seed gives a final loss that differs by 2.8e-03 to 3.7e-03 nats. The largest chunk-length difference at a fixed seed is 1.9e-03 nats and the seed spread is 3.8e-03 to 4.2e-03. So a same-seed comparison between two chunk lengths is no tighter than a comparison between two reruns of one chunk length, and the chunk-length differences seen here are inside that floor.
 
 
 

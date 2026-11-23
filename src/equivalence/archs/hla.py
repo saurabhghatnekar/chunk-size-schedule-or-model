@@ -19,10 +19,14 @@ Setting every w to one recovers Gated DeltaNet exactly, for any chunk length
 router acts on chunks, so moving the boundary changes what can be routed, and a
 single chunk spanning the sequence has no history to route and is plain GDN.
 
-This is written from the method section of the paper, not from released code;
-treat it as HLA-style until checked against an official implementation. The
-inference-time threshold on w and the training regulariser are not part of the
-forward function tested here.
+This is written from the method section of the paper (equations 1 to 9, checked against the text), not from
+the authors' code; treat it as HLA-style. One difference from the paper: the pooled window representatives
+are computed from the layer input, where the paper stacks the pre-convolution keys of the base Gated DeltaNet
+layer. The authors' released code (github.com/Caesarhhh/HLA_, read on 2026-11-23, not used here) differs
+from the paper's equation 7 in adding a bias of 2.2 inside the routing sigmoid, and it fixes the chunk length
+at 256. `gate_bias=2.2` reproduces that bias: the deviation across chunk lengths is then 0.050 instead of
+0.14 at both precisions, so the layer is chunk-dependent either way. The inference-time threshold on w and the training
+regulariser are not part of the forward function tested here.
 """
 from __future__ import annotations
 
@@ -64,10 +68,12 @@ def _chunk_transitions(k, v, beta, g, chunk_size: int):
 class HLAMixer(DeltaMixer):
     name = "hla"
 
-    def __init__(self, d_model: int, n_heads: int, pool_window: int = 16, force_unit_routing: bool = False):
+    def __init__(self, d_model: int, n_heads: int, pool_window: int = 16, force_unit_routing: bool = False,
+                 gate_bias: float = 0.0):
         super().__init__(d_model, n_heads, gated=True)
         self.pool_window = pool_window
         self.force_unit_routing = force_unit_routing
+        self.gate_bias = gate_bias  # the released code adds 2.2 inside the sigmoid; the paper's equation has none
         self.route_q = nn.Linear(d_model, d_model, bias=False)
         self.pool_k = nn.Linear(d_model, d_model, bias=False)
         self.pool_v = nn.Linear(d_model, d_model, bias=False)
@@ -114,7 +120,7 @@ class HLAMixer(DeltaMixer):
                     hist = a_j @ hist + b_j
                     continue
                 scores = q_route[:, :, s:e] @ pooled[j].transpose(-1, -2) / math.sqrt(head_dim)  # (B,H,L,P)
-                w = torch.sigmoid(torch.logsumexp(scores, dim=-1) - math.log(scores.shape[-1]))
+                w = torch.sigmoid(torch.logsumexp(scores, dim=-1) - math.log(scores.shape[-1]) + self.gate_bias)
                 w = w[..., None, None]
                 hist = (1.0 - w) * hist + w * (a_j @ hist + b_j)
             state = a_pref[:, :, s:e] @ hist + b_pref[:, :, s:e]  # (B,H,L,K,V)

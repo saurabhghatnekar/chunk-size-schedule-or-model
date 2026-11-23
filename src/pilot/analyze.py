@@ -128,7 +128,8 @@ def document(frame: pd.DataFrame, summary: pd.DataFrame, floors: pd.DataFrame) -
         floor_lines.append(f"| {REGIMES[r['regime']]} | {r['chunk']} | {r['seed']} | {r['losses']}{note} | {r['floor']:.1e} | {r['same_weight_norm']} |")
     done = summary[summary.get("d_max_abs", pd.Series(dtype=float)).notna()] if "d_max_abs" in summary else summary.iloc[:0]
     if len(floors) and len(done):
-        floor_note = (f"Training with these kernels is not reproducible run to run: the same configuration and seed "
+        floor_note = (f"Training runs with these kernels did not reproduce across fresh containers (cause not isolated; "
+                      f"Triton's autotuner choosing a different kernel configuration is a candidate): the same configuration and seed "
                       f"gives a final loss that differs by {floors['floor'].min():.1e} to {floors['floor'].max():.1e} nats. "
                       f"The largest chunk-length difference at a fixed seed is {done['d_max_abs'].max():.1e} nats and the seed "
                       f"spread is {done['sigma_seed'].min():.1e} to {done['sigma_seed'].max():.1e}. So a same-seed comparison "

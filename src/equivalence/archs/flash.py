@@ -1,18 +1,21 @@
 """FLASH mixed chunk attention, causal variant (Hua et al., ICML 2022, arXiv 2202.10447).
 
-Follows the paper's pseudo-code (Code 8, `MixedChunkAttention`). With chunk
-(group) size g, a shared low-dimensional z = swish(W x) is turned into four
-per-dimension scaled and shifted copies (quad_q, quad_k, lin_q, lin_k), and
+Follows the paper's pseudo-code for the FLASH block (Code 8 in its appendix), checked against the listing.
+With chunk (group) size g, a shared low-dimensional z = silu(W x) is turned into four per-dimension scaled
+and shifted copies (quad_q, quad_k, lin_q, lin_k), and
 
     quadratic_t = sum_{m in chunk(t), m <= t} relu( quad_q_t . quad_k_m / g + bias[t - m] )^2  v_m
-    linear_t    = lin_q_t . ( sum_{chunks c' < chunk(t)}  sum_{m in c'} lin_k_m^T v_m / g )
+    linear_t    = lin_q_t . mean_{chunks c' < chunk(t)} ( sum_{m in c'} lin_k_m^T v_m / g )
     out         = W_o ( u * (quadratic + linear) )
 
-The chunk boundary decides which token pairs interact through the quadratic
-kernel and which only through the linear summary, and g also appears as a
-normaliser in both paths, so the chunk length is architectural by construction.
-The relative-position bias is one learned scalar per offset with a fixed table
-size, so the parameter count does not depend on the chunk length.
+The chunk boundary decides which token pairs interact through the quadratic kernel and which only through
+the linear summary, and g also appears as a normaliser in both paths, so the chunk length is architectural
+by construction.
+
+Differences from the listing, none of which involves the chunk boundary: no rotary embedding is applied to
+the shared representation; the scale parameters are initialised around one; the relative-position bias is
+one learned scalar per offset from a fixed-size table, so the parameter count does not depend on the chunk
+length; and u, v and z come from three linear layers where the listing splits one.
 """
 from __future__ import annotations
 
@@ -63,9 +66,11 @@ class FlashMixer(nn.Module):
         kernel = F.relu(quad_q @ quad_k.transpose(-1, -2) / g + bias).pow(2)
         quadratic = kernel.masked_fill(~causal, 0.0) @ v
 
-        # linear attention across chunks: summary of all strictly earlier chunks
+        # linear attention across chunks: the mean of the summaries of all strictly earlier chunks
+        # (Code 8: the causal segment mask is row-normalised, so earlier chunks are averaged, not summed)
         lin_kv = lin_k.transpose(-1, -2) @ v / g  # (B,G,S,E)
-        lin_kv = lin_kv.cumsum(dim=1) - lin_kv
+        earlier = torch.arange(n_groups, device=x.device, dtype=lin_kv.dtype).clamp(min=1).view(1, -1, 1, 1)
+        lin_kv = (lin_kv.cumsum(dim=1) - lin_kv) / earlier
         linear = lin_q @ lin_kv
 
         out = (quadratic + linear).reshape(bsz, seq_len + pad, -1)[:, :seq_len]

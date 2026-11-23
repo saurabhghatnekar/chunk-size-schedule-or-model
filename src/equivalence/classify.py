@@ -196,6 +196,52 @@ def figure(frame: pd.DataFrame, summary: pd.DataFrame, path_stem) -> None:
     plt.close(fig)
 
 
+def trained_section(frame: pd.DataFrame) -> str:
+    """The same test on two small trained models, from results/equivalence_trained.csv."""
+    from .precision_scaling import classify as classify_verdict
+    from .precision_scaling import verdict as scaling_verdict
+
+    ok = frame[frame["status"] == "ok"]
+    ref = ok[ok["tier"] == "trained-reference"]
+    lines = ["| Trained model | Chunk lengths | Output dev. f64 | Gradient dev. f64 | Output dev. f32 | Shrink f32 to f64 | Diagnostic | Class |",
+             "|---|---|---|---|---|---|---|---|"]
+    for arch, g in ref.groupby("architecture", sort=False):
+        worst = g.groupby("dtype")[["fwd_max_rel", "grad_max_rel"]].max()
+        d32, d64 = worst.loc["float32"].max(), worst.loc["float64"].max()
+        v = scaling_verdict(d32, d64)
+        chunks = " ".join(str(int(c)) for c in dict.fromkeys(g["chunk"]))
+        lines.append(f"| {arch} | {chunks} | {fmt(worst.loc['float64', 'fwd_max_rel'])} | {fmt(worst.loc['float64', 'grad_max_rel'])} | "
+                     f"{fmt(worst.loc['float32', 'fwd_max_rel'])} | {fmt(d32 / d64 if d64 > 0 else float('inf'))} | {v} | "
+                     f"**{classify_verdict(v, g['prior'].iloc[0])}** |")
+    kern = ok[ok["tier"] == "trained-kernel"].copy()
+    klines = ["| Trained model | Arithmetic | Chunk | Dev. from first chunk, outputs | Dev. from float64 reference, outputs | Dev. from float64 reference, gradients |",
+              "|---|---|---|---|---|---|"]
+    for _, r in kern.iterrows():
+        grad = r.get("oracle_grad_max_rel")
+        klines.append(f"| {r['architecture']} | {r['dtype']} | {int(r['chunk'])} | {fmt(r['fwd_max_rel'])} | "
+                      f"{fmt(r['oracle_fwd_max_rel'])} | {fmt(grad) if pd.notna(grad) else 'n/a'} |")
+    first = ok.iloc[0]
+    return f"""## Result: the same test on trained weights
+
+Everything above uses randomly initialised weights. Here the two pilot models are trained first
+({int(first['steps'])} steps on enwik8, about 5M parameters each) and the test is repeated on the trained weights, with a
+batch of two validation windows of 1024 bytes. Outputs are the logits; gradients are those of the next-byte
+loss with respect to every weight.
+
+Reference ops in float32 and float64, same decision rule as for the untrained models:
+
+{chr(10).join(lines)}
+
+The shipped code on a GPU with the same trained weights. For the Gated DeltaNet model the float64 reference
+is the token-by-token recurrence, the same for every chunk length; for the LaCT model it is the reference
+definition at the same chunk length, so "from first chunk" shows the chunk dependence and "from float64
+reference" shows how closely the shipped op follows its own definition:
+
+{chr(10).join(klines)}
+
+"""
+
+
 KERNEL_SCOPE_UNTESTED = """- **Implementations, not architectures in general.** The reference tier is code written for this project
   from the papers. The library tier covers only pure-PyTorch reference ops. The Triton kernels people
   train with (`chunk_gla`, `chunk_delta_rule`, `chunk_gated_delta_rule`, the Mamba-2 CUDA path, the fused
@@ -279,6 +325,16 @@ the variant was still compiling; in an earlier run the same variants ran into th
                           f"containers, `results/pilot_precision.csv`), the forward pass at chunk 64 is "
                           f"{fmt(fixed['kernel_oracle_dev'].max())} from the float64 recurrence. Gradients were not "
                           f"compared in that configuration.")
+    solve_csv = RESULTS / "equivalence_kernels_ieee_solve.csv"
+    if solve_csv.exists():
+        solve = pd.read_csv(solve_csv)
+        solve = solve[(solve["architecture"] == "fla_chunk_gated_delta_rule") & (solve["chunk"] == 64)
+                      & (solve["variant"] == "chunk") & solve["oracle_fwd_max_rel"].notna()]
+        if len(solve):
+            solve_note = (f"That is the source: with the solve also set to IEEE "
+                          f"(`results/equivalence_kernels_ieee_solve.csv`), chunk 64 is "
+                          f"{fmt(solve['oracle_fwd_max_rel'].max())} from the float64 recurrence in its outputs and "
+                          f"{fmt(solve['oracle_grad_max_rel'].max())} in its gradients.")
     ieee_csv = RESULTS / "equivalence_kernels_ieee.csv"
     if ieee_csv.exists():
         both = []
@@ -353,7 +409,7 @@ and the float32 and float16 rows are the informative ones.
 
 
 def document(frame: pd.DataFrame, summary: pd.DataFrame, control_lines: list[str], controls_passed: bool,
-             kernels_md: str = "") -> str:
+             kernels_md: str = "", trained_md: str = "") -> str:
     cfg = ModelConfig()
     env = frame.iloc[0]
     view = summary.copy()
@@ -476,7 +532,7 @@ run a copy of the same source with those casts lifted to float64, used only for 
 {per_chunk_table(frame, "library", "float32", "fwd_max_rel")}
 
 {kernels_md}
-## Low precision (descriptive only; this is what the precision study in Milestones 2 and 4 has to measure)
+{trained_md}## Low precision (descriptive only; this is what the precision study in Milestones 2 and 4 has to measure)
 
 {md_table(sixteen, sixteen_cols)}
 
@@ -512,10 +568,7 @@ kept in float32. It says the precision study is worth running; it does not say w
 ## Scope and limits
 
 {KERNEL_SCOPE_TESTED if kernels_md else KERNEL_SCOPE_UNTESTED}
-- **Random initialisation.** The checkpoint is a seeded initialisation, not a trained model. Whether chunk
-  length changes the function does not depend on the weights for the mechanisms above, but the *size* of
-  the rounding deviation does (gates near one, long effective memory). Repeat on a trained checkpoint
-  before quoting magnitudes.
+{"- **Mostly random initialisation.** The main tables use a seeded initialisation. The test was repeated on two small trained models (section above) with the same outcome; it has not been run on a large or publicly released checkpoint." if trained_md else "- **Random initialisation.** The checkpoint is a seeded initialisation, not a trained model. Whether chunk length changes the function does not depend on the weights for the mechanisms above, but the *size* of the rounding deviation does (gates near one, long effective memory). Repeat on a trained checkpoint before quoting magnitudes."}
 - **HLA is written from the method section of the paper**, not from released code, and is labelled
   HLA-style. The inference-time gate threshold and the training regulariser are not part of the test.
 - **FLASH** follows the paper's pseudo-code with one substitution: a fixed-size table of relative-position
@@ -541,7 +594,9 @@ def main() -> int:
     DOCS.mkdir(exist_ok=True)
     kernel_csv = RESULTS / "equivalence_kernels.csv"
     kernels_md = kernel_section(pd.read_csv(kernel_csv)) if kernel_csv.exists() else ""
-    (DOCS / "classification.md").write_text(document(frame, summary, lines, passed, kernels_md))
+    trained_csv = RESULTS / "equivalence_trained.csv"
+    trained_md = trained_section(pd.read_csv(trained_csv)) if trained_csv.exists() else ""
+    (DOCS / "classification.md").write_text(document(frame, summary, lines, passed, kernels_md, trained_md))
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(summary[["tier", "architecture", "fwd_dev_float32", "fwd_dev_float64", "grad_dev_float64",
                        "verdict", "classification"]].to_string(index=False, float_format=lambda v: f"{v:.2e}"))

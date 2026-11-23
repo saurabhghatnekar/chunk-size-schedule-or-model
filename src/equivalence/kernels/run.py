@@ -55,7 +55,7 @@ def base_row(case: KernelCase, dtype_name: str, seq_len: int) -> dict:
     }
 
 
-def iter_unit(case: KernelCase, seq_len: int, dtype_name: str):
+def iter_unit(case: KernelCase, seq_len: int, dtype_name: str, only_chunks: tuple = ()):
     """One (kernel, input format, sequence length) unit. Yields ("start", {...}) before each variant and
     ("row", {...}) after it, so a caller that loses the process mid-variant still has everything before it
     and knows which variant it was in."""
@@ -66,6 +66,8 @@ def iter_unit(case: KernelCase, seq_len: int, dtype_name: str):
     base = base_row(case, dtype_name, seq_len)
     probe, ref, oracle_cache = None, None, {}
     for variant in case.variants:
+        if only_chunks and variant.chunk not in only_chunks:
+            continue
         row = {**base, "variant": variant.label, "chunk": variant.chunk}
         yield "start", {"variant": variant.label, "chunk": variant.chunk}
         try:

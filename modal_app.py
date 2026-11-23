@@ -37,23 +37,24 @@ image = (
 
 app = modal.App("chunk-size-equivalence-kernels", image=image)
 GPU = os.environ.get("CHUNK_GPU", "A10G")
-# Ablation: CHUNK_TRITON_F32=ieee asks Triton for IEEE float32 dot products instead of its TF32 default.
-# Rows then go to results/equivalence_kernels_ieee.csv.
+# Ablation: CHUNK_TRITON_F32=ieee asks Triton for IEEE float32 dot products instead of its TF32 default;
+# "ieee+solve" also sets the gated delta-rule kernel's explicit triangular-solve precision to IEEE.
+# Rows then go to results/equivalence_kernels_ieee.csv or results/equivalence_kernels_ieee_solve.csv.
 TRITON_F32 = os.environ.get("CHUNK_TRITON_F32", "")
 
 
 # Seconds for one (kernel, input format, sequence length). Compiling and autotuning a kernel for a new block
 # size is CPU-bound and slow, so the container gets real cores; with Modal's default fractional CPU the same
 # compiles ran several times longer and some units sat compiling until the cap.
-UNIT_TIMEOUT = 900
+UNIT_TIMEOUT = int(os.environ.get("CHUNK_UNIT_TIMEOUT", 900))
 
 
 @app.function(gpu=GPU, cpu=8.0, timeout=UNIT_TIMEOUT, max_containers=10)
-def kernel_unit(name: str, dtype_name: str, seq_len: int, triton_f32: str = ""):
+def kernel_unit(name: str, dtype_name: str, seq_len: int, triton_f32: str = "", only_chunks: tuple = ()):
     """One (kernel, input format, sequence length) per container, streamed back row by row, so a hang in one
     kernel variant costs that variant and nothing else."""
     if triton_f32:
-        os.environ["TRITON_F32_DEFAULT"] = triton_f32  # must be set before Triton is imported
+        os.environ["TRITON_F32_DEFAULT"] = triton_f32.split("+")[0]  # must be set before Triton is imported
     from src.equivalence.kernels.cases import CASES
     from src.equivalence.kernels.run import environment, iter_unit
     from src.equivalence.library import vendor
@@ -68,9 +69,16 @@ def kernel_unit(name: str, dtype_name: str, seq_len: int, triton_f32: str = ""):
     if triton_f32:
         import triton
         env["triton_f32_default"] = str(triton.knobs.language.fp32_default)
+    if triton_f32.endswith("+solve"):
+        # The gated delta-rule forward kernel requests TF32 explicitly for its triangular solve on GPUs that
+        # support it, which the environment switch does not override. Set that to IEEE as well.
+        import fla.ops.gated_delta_rule.chunk_fwd as chunk_fwd
+        import triton.language as tl
+        chunk_fwd.SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
+        env["solve_tril_precision"] = str(chunk_fwd.SOLVE_TRIL_DOT_PRECISION.value)
     yield "env", env
     case = next(c for c in CASES if c.name == name)
-    for kind, payload in iter_unit(case, seq_len, dtype_name):
+    for kind, payload in iter_unit(case, seq_len, dtype_name, only_chunks):
         print(f"{kind:5s} {name} {dtype_name} T={seq_len} {payload.get('variant')}:{payload.get('chunk')} "
               f"{str(payload.get('status', ''))[:90]}", flush=True)
         yield kind, payload
@@ -108,7 +116,7 @@ def triton_dot_precision() -> str:
 
 
 @app.local_entrypoint()
-def main(only: str = "", dtype: str = ""):
+def main(only: str = "", dtype: str = "", seq: int = 0, chunks: str = ""):
     import datetime as dt
     from concurrent.futures import ThreadPoolExecutor
 
@@ -117,14 +125,16 @@ def main(only: str = "", dtype: str = ""):
     from src.equivalence.kernels.cases import CASES
     from src.equivalence.kernels.run import base_row
 
+    only_chunks = tuple(int(c) for c in chunks.split(",")) if chunks else ()
     cases = [c for c in CASES if not only or c.name in only.split(",")]
-    units = [(c, d, t) for c in cases for t in c.seq_lens for d in c.dtypes if not dtype or d in dtype.split(",")]
+    units = [(c, d, t) for c in cases for t in c.seq_lens for d in c.dtypes
+             if (not dtype or d in dtype.split(",")) and (not seq or t == seq)]
 
     def collect(unit):
         case, dtype_name, seq_len = unit
         env, rows, pending = {}, [], None
         try:
-            for kind, payload in kernel_unit.remote_gen(case.name, dtype_name, seq_len, TRITON_F32):
+            for kind, payload in kernel_unit.remote_gen(case.name, dtype_name, seq_len, TRITON_F32, only_chunks):
                 if kind == "env":
                     env = payload
                 elif kind == "start":
@@ -144,11 +154,17 @@ def main(only: str = "", dtype: str = ""):
     env = next((e for e, _ in results if e), {"gpu": GPU})
     frame = pd.DataFrame([{**row, **env} for _, rows in results for row in rows])
     frame["run_utc"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    stem = "equivalence_kernels" + (f"_{TRITON_F32}" if TRITON_F32 else "")
+    stem = "equivalence_kernels" + (f"_{TRITON_F32.replace('+', '_')}" if TRITON_F32 else "")
     out = Path(__file__).resolve().parent / "results" / f"{stem}.csv"
     if out.exists():
         previous = pd.read_csv(out)
         same = previous["gpu"].isin(frame["gpu"].unique()) & previous["architecture"].isin([c.name for c in cases])
+        if dtype:
+            same &= previous["dtype"].isin(dtype.split(","))
+        if seq:
+            same &= previous["seq_len"] == seq
+        if only_chunks:
+            same &= previous["chunk"].isin(only_chunks)
         frame = pd.concat([previous[~same], frame], ignore_index=True)
     frame.to_csv(out, index=False)
     print(f"wrote {out}  ({len(frame)} rows in file, {len(units)} unit(s) run, GPU {env['gpu']})")

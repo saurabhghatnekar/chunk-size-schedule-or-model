@@ -8,3 +8,6 @@ results/logs/*.log
 
 # the project roadmap is a third-party document and is not redistributed here
 Chunk Size Paper.pdf
+
+# weights of the trained pilot models (about 20 MB each); the test rows are in results/equivalence_trained.csv
+checkpoints/trained_*.pt

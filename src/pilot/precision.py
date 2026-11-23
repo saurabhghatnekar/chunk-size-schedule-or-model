@@ -63,6 +63,11 @@ def configure_arithmetic(regime: str) -> dict:
     }
 
 
+def wide(x: torch.Tensor) -> torch.Tensor:
+    """At least float32: low-precision tensors are widened for norms and gates, float64 is left alone."""
+    return x if x.dtype == torch.float64 else x.float()
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -70,7 +75,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps).to(x.dtype) * self.weight
+        return x * torch.rsqrt(wide(x).pow(2).mean(-1, keepdim=True) + self.eps).to(x.dtype) * self.weight
 
 
 class GatedDeltaBlock(nn.Module):
@@ -91,22 +96,31 @@ class GatedDeltaBlock(nn.Module):
         self.norm2 = RMSNorm(d)
         self.mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
 
-    def forward(self, x, chunk: int, kernel_dtype: torch.dtype, recurrent: bool):
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-
+    def forward(self, x, chunk: int, kernel_dtype: torch.dtype, recurrent: bool, mixer: str = "kernel"):
         bsz, t, d = x.shape
         y = self.norm1(x)
         heads = lambda z: z.view(bsz, t, self.h, d // self.h)
-        q = F.normalize(heads(F.silu(self.q_proj(y))).float(), dim=-1)
-        k = F.normalize(heads(F.silu(self.k_proj(y))).float(), dim=-1)
+        q = F.normalize(wide(heads(F.silu(self.q_proj(y)))), dim=-1)
+        k = F.normalize(wide(heads(F.silu(self.k_proj(y)))), dim=-1)
         v = heads(F.silu(self.v_proj(y)))
-        beta = self.b_proj(y).float().sigmoid()
-        g = -self.a_log.exp() * F.softplus(self.a_proj(y).float() + self.dt_bias)
+        beta = wide(self.b_proj(y)).sigmoid()
+        g = -self.a_log.exp() * F.softplus(wide(self.a_proj(y)) + self.dt_bias)
         # every kernel input is cast to one format, so the kernel sees exactly the arithmetic the regime names
         q, k, v, g, beta = (z.to(kernel_dtype) for z in (q, k, v, g, beta))
-        if recurrent:
+        if mixer == "reference":
+            # the dtype-generic reference ops of the equivalence test, in whatever precision the model is in
+            from ..equivalence.archs.delta import chunk_gated_delta, recurrent_gated_delta
+
+            tr = lambda z: z.transpose(1, 2)
+            args = (tr(q) * (d // self.h) ** -0.5, tr(k), tr(v), tr(beta), tr(g))
+            o = tr(recurrent_gated_delta(*args) if recurrent else chunk_gated_delta(*args, chunk))
+        elif recurrent:
+            from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+
             o = fused_recurrent_gated_delta_rule(q, k, v, g=g, beta=beta)[0]
         else:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
             o = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk)[0]
         o = self.o_norm(o).reshape(bsz, t, d).to(y.dtype) * F.silu(self.g_proj(y))
         x = x + self.o_proj(o)
@@ -121,8 +135,16 @@ class ByteLM(nn.Module):
         self.norm = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, 256, bias=False)
 
-    def forward(self, tokens, chunk: int, regime: str, reference: bool = False):
-        """`reference=True` is the common evaluation pass: float32, recurrent kernel, no autocast."""
+    def forward(self, tokens, chunk: int, regime: str, reference: bool = False, mixer: str = "kernel"):
+        """`reference=True` is the common evaluation pass: float32, recurrent kernel, no autocast.
+        `mixer="reference"` replaces the library kernel by this repository's reference ops and runs in the
+        model's own precision (float32 or float64), chunkwise at `chunk` or recurrent if `reference`."""
+        if mixer == "reference":
+            dtype = self.head.weight.dtype
+            x = self.embed(tokens)
+            for block in self.blocks:
+                x = block(x, chunk, dtype, recurrent=reference, mixer="reference")
+            return self.head(self.norm(x))
         low = regime == "bf16" and not reference
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=low):
             x = self.embed(tokens)
@@ -172,7 +194,8 @@ def kernel_oracle_deviation(cfg: PilotConfig) -> float:
     return deviation(ref, out)["max_rel"]
 
 
-def run(cfg: PilotConfig, log=print) -> list[dict]:
+def run(cfg: PilotConfig, log=print, sink: dict | None = None) -> list[dict]:
+    """Train one configuration. If `sink` is given, the trained model is left in sink["model"]."""
     arithmetic = configure_arithmetic(cfg.regime)
     base = {**asdict(cfg), **arithmetic, "gpu": torch.cuda.get_device_name(0), "torch": torch.__version__,
             "kernel_oracle_dev": kernel_oracle_deviation(cfg)}
@@ -226,4 +249,6 @@ def run(cfg: PilotConfig, log=print) -> list[dict]:
             log(f"  step {step:5d}  train {row['train_loss']:.4f}  val own {row['val_loss_own']:.4f}  "
                 f"val ref {row['val_loss_ref']:.4f}  {row['tokens_per_s'] / 1e3:.0f}k tok/s  {row['wall_s']:.0f}s")
             running, count = 0.0, 0
+    if sink is not None:
+        sink["model"] = model
     return rows

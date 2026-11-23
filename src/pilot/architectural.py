@@ -91,7 +91,7 @@ class LaCTBlock(nn.Module):
         self.norm2 = RMSNorm(d)
         self.mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
 
-    def forward(self, x, chunk: int, band):
+    def forward(self, x, chunk: int, band, reference: bool = False):
         bsz, t, d = x.shape
         h = self.h
         y = self.norm1(x)
@@ -102,6 +102,21 @@ class LaCTBlock(nn.Module):
         attn = attn.transpose(1, 2).reshape(bsz, t, d)
 
         fast = lambda z: heads(z).reshape(bsz * h, t, d // h)  # heads folded into the batch, as in the LaCT layer
+        if reference:
+            # this repository's dtype-generic restatement of the op, in the model's own precision, no autocast
+            from ..equivalence.archs.lact import block_causal_lact_swiglu
+
+            l2r = lambda z: z / (z.norm(dim=-1, keepdim=True) + 1e-5)
+            fq = l2r(F.silu(fast(q * self.qk_scale[:, 0] + self.qk_offset[:, 0])))
+            fk = l2r(F.silu(fast(k * self.qk_scale[:, 1] + self.qk_offset[:, 1])))
+            fv = F.silu(fast(v))
+            lr = F.softplus(self.lr_proj(y) + self.base_lr_inv)
+            lr0, lr1, lr2 = lr.view(bsz, t, h, 3).transpose(1, 2).reshape(bsz * h, t, 3).split(1, dim=-1)
+            fw = block_causal_lact_swiglu(self.w0.repeat(bsz, 1, 1), self.w1.repeat(bsz, 1, 1), self.w2.repeat(bsz, 1, 1),
+                                          fq, fk, fv, lr0, lr1, lr2, chunk)
+            fw = self.ttt_norm(fw).view(bsz, h, t, d // h).transpose(1, 2).reshape(bsz, t, d)
+            x = x + self.o_proj(attn + fw)
+            return x + self.mlp(self.norm2(x))
         l2 = lambda z: (z / (z.float().norm(dim=-1, keepdim=True) + 1e-5)).to(torch.bfloat16)
         fq = l2(F.silu(fast(q * self.qk_scale[:, 0] + self.qk_offset[:, 0])))
         fk = l2(F.silu(fast(k * self.qk_scale[:, 1] + self.qk_offset[:, 1])))
@@ -128,8 +143,14 @@ class LaCTByteLM(nn.Module):
         gap = idx[:, None] - idx[None, :]
         self.register_buffer("band", (gap >= 0) & (gap < cfg.window), persistent=False)
 
-    def forward(self, tokens, chunk: int):
+    def forward(self, tokens, chunk: int, reference: bool = False):
+        """`reference=True` runs this repository's restatement of the op in the model's own precision."""
         t = tokens.shape[1]
+        if reference:
+            x = self.embed(tokens)
+            for block in self.blocks:
+                x = block(x, chunk, self.band[:t, :t], reference=True)
+            return self.head(self.norm(x))
         with torch.autocast("cuda", dtype=torch.bfloat16):
             x = self.embed(tokens)
             for block in self.blocks:
@@ -150,7 +171,8 @@ def evaluate(model, val, cfg: ArchConfig, chunk: int) -> float:
     return total / (cfg.eval_windows * cfg.seq_len)
 
 
-def run(cfg: ArchConfig, log=print) -> list[dict]:
+def run(cfg: ArchConfig, log=print, sink: dict | None = None) -> list[dict]:
+    """Train one configuration. If `sink` is given, the trained model is left in sink["model"]."""
     base = {**{k: v for k, v in asdict(cfg).items() if k != "eval_chunks"},
             "gpu": torch.cuda.get_device_name(0), "torch": torch.__version__}
     train, val = load_data(cfg.data_path)
@@ -205,6 +227,8 @@ def run(cfg: ArchConfig, log=print) -> list[dict]:
             log(f"  step {step:5d}  train {row['train_loss']:.4f}  val {row['val_loss']:.4f}  "
                 f"{row['tokens_per_s'] / 1e3:.0f}k tok/s  {row['wall_s']:.0f}s")
             running, count = 0.0, 0
+    if sink is not None:
+        sink["model"] = model
     return rows
 
 

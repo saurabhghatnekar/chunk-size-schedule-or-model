@@ -257,6 +257,57 @@ Forward only (no backward pass available, so no gradient comparison): `fla_chunk
 
 Inputs with an all-zero gradient in every variant that ran (for LaCT this is expected when the only variant is a chunk of at least the sequence length, which never updates the fast weights): `lact_fused_triton_kernel` (bfloat16): k lr0 lr1 lr2 v.
 
+### NVIDIA H100 80GB HBM3
+
+torch 2.15.0+cu132, triton 3.9.0, CUDA 13.2, `torch.compile` disabled, run 2026-11-23T06:19:24Z.
+
+Controls and yardstick (the reference chunkwise Gated DeltaNet from this repository, run on the same GPU in the same formats):
+
+| Kernel | Input format | Variants that ran (label:chunk) | Cross-chunk dev., outputs | Cross-chunk dev., gradients | Oracle dev., outputs | Oracle dev., gradients | Definition's own cross-chunk dev. (f64) | Floor | Cross / floor | Oracle / floor | Diagnostic | Class |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `gpu_softmax_tile` | float32 | torch scaled_dot_product_attention:0 tiled:16 tiled:64 tiled:256 | 3.8e-07 | 1.1e-06 | 4.1e-07 | 1.0e-06 | 0 (identical) | 6.0e-05 | 1.9e-02 | 1.7e-02 | ROUNDING | **scheduling** |
+| `gpu_softmax_tile` | bfloat16 | torch scaled_dot_product_attention:0 tiled:16 tiled:64 tiled:256 | 5.1e-03 | 5.2e-03 | 6.0e-03 | 4.9e-03 | 0 (identical) | 2.9e-03 | 1.8e+00 | 2.1e+00 | ROUNDING | **scheduling** |
+| `gpu_ref_gated_delta` | float32 | chunkwise:16 chunkwise:32 chunkwise:64 chunkwise:256 | 5.3e-07 | 6.9e-07 | 5.8e-07 | 6.3e-07 | 0 (identical) | 6.0e-05 | 1.2e-02 | 1.1e-02 | ROUNDING | **scheduling** |
+| `gpu_ref_gated_delta` | bfloat16 | chunkwise:16 chunkwise:32 chunkwise:64 chunkwise:256 | 4.5e-02 | 4.2e-02 | 4.3e-02 | 4.5e-02 | 0 (identical) | 2.8e-03 | 1.6e+01 | 1.6e+01 | ROUNDING | **scheduling** |
+| `gpu_perturbed_leak_1e-2` | float32 | chunkwise:16 chunkwise:32 chunkwise:64 | 9.9e-03 | 1.5e-02 | 1.1e-02 | 1.8e-02 | 0 (identical) | 6.0e-05 | 2.5e+02 | 3.0e+02 | STRUCTURAL | **implementation bug** |
+| `gpu_perturbed_leak_1e-2` | bfloat16 | chunkwise:16 chunkwise:32 chunkwise:64 | 1.7e-02 | 2.7e-02 | 1.7e-02 | 2.1e-02 | 0 (identical) | 2.8e-03 | 1.0e+01 | 7.5e+00 | ROUNDING | **scheduling** |
+
+Injected defects flagged: `gpu_perturbed_leak_1e-2` in float32. **Not flagged** (the test cannot see them at this precision): `gpu_perturbed_leak_1e-2` in bfloat16.
+
+Kernels:
+
+| Kernel | Input format | Variants that ran (label:chunk) | Cross-chunk dev., outputs | Cross-chunk dev., gradients | Oracle dev., outputs | Oracle dev., gradients | Definition's own cross-chunk dev. (f64) | Floor | Cross / floor | Oracle / floor | Diagnostic | Class |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `fla_chunk_delta_rule` | float32 | fused_recurrent:1 | 0 (identical) | n/a | 2.8e-07 | 3.9e-07 | 0 (identical) | 6.0e-05 | 0 (identical) | 6.5e-03 | ONE VARIANT | **single variant: matches its reference** |
+| `fla_chunk_delta_rule` | bfloat16 | fused_recurrent:1 chunk:16 chunk:32 chunk:64 | 4.9e-03 | 1.1e-02 | 5.3e-03 | 7.6e-03 | 0 (identical) | 2.6e-03 | 4.0e+00 | 2.9e+00 | ROUNDING | **scheduling** |
+| `fla_chunk_delta_rule` | float16 | fused_recurrent:1 chunk:16 chunk:32 chunk:64 | 6.1e-04 | 1.3e-03 | 6.2e-04 | 1.0e-03 | 0 (identical) | 3.3e-04 | 4.0e+00 | 3.0e+00 | ROUNDING | **scheduling** |
+| `fla_chunk_gated_delta_rule` | float32 | fused_recurrent:1 chunk:16 chunk:32 chunk:64 | 1.9e-03 | n/a | 1.9e-03 | 1.8e-03 | 0 (identical) | 6.0e-05 | 3.2e+01 | 3.2e+01 | INCONCLUSIVE | **unresolved** |
+| `fla_chunk_gated_delta_rule` | bfloat16 | fused_recurrent:1 chunk:16 chunk:32 chunk:64 | 5.6e-03 | n/a | 6.4e-03 | 7.4e-03 | 0 (identical) | 2.8e-03 | 2.0e+00 | 2.7e+00 | ROUNDING | **scheduling** |
+| `fla_chunk_simple_gla` | float32 | fused_recurrent:1 chunk:16 chunk:32 | 1.5e-03 | 1.5e-03 | 1.5e-03 | 1.5e-03 | 0 (identical) | 6.0e-05 | 2.6e+01 | 2.6e+01 | INCONCLUSIVE | **unresolved** |
+| `fla_chunk_simple_gla` | bfloat16 | fused_recurrent:1 chunk:16 chunk:32 chunk:64 | 5.7e-03 | 5.8e-03 | 3.7e-03 | 4.3e-03 | 0 (identical) | 2.9e-03 | 2.0e+00 | 1.5e+00 | ROUNDING | **scheduling** |
+| `fla_chunk_gla` | float32 | fused_recurrent:1 chunk (size fixed by the kernel):64 | 1.4e-03 | 1.5e-03 | 1.4e-03 | 1.5e-03 | 0 (identical) | 6.0e-05 | 2.5e+01 | 2.5e+01 | INCONCLUSIVE | **unresolved** |
+| `fla_chunk_gla` | bfloat16 | fused_recurrent:1 | 0 (identical) | n/a | 2.7e-03 | 3.3e-03 | 0 (identical) | 3.2e-03 | 0 (identical) | 1.0e+00 | ONE VARIANT | **single variant: matches its reference** |
+| `fla_chunk_ttt_linear` | float32 | chunk:16 chunk:64 | 2.2e+00 | n/a | 3.1e-07 | 2.1e-04 | 2.2e+00 | 6.0e-05 | 3.8e+04 | 3.5e+00 | STRUCTURAL | **architectural** |
+| `fla_chunk_ttt_linear` | bfloat16 | chunk:16 chunk:64 chunk:256 | 7.9e+00 | 2.3e+00 | 8.0e-03 | 7.4e-03 | 7.9e+00 | 3.6e-03 | 2.2e+03 | 2.2e+00 | STRUCTURAL | **architectural** |
+
+Variants a kernel refused, or that did not finish. These are recorded on purpose: what a kernel permits on a
+given GPU bounds any chunk-length sweep. "Input aborted" means the container was stopped from outside while
+the variant was still compiling; in an earlier run the same variants ran into the 25-minute cap.
+
+| Kernel | Input format | Refused (label:chunk) | Error |
+|---|---|---|---|
+| `fla_chunk_delta_rule` | float32 | chunk:16 chunk:32 chunk:64 chunk:128 | AssertionError: ChunkDeltaRuleFunction does not support float32. Please use bfloat16. |
+| `fla_chunk_delta_rule` | bfloat16 | chunk:128 | ValueError: 'chunk_size' must be 16, 32, or 64, got 128. |
+| `fla_chunk_delta_rule` | float16 | chunk:128 | ValueError: 'chunk_size' must be 16, 32, or 64, got 128. |
+| `fla_chunk_gated_delta_rule` | float32 | chunk:128 | ValueError: 'chunk_size' must be 16, 32, or 64 for Gated Delta Rule, got 128. |
+| `fla_chunk_gated_delta_rule` | bfloat16 | chunk:128 | ValueError: 'chunk_size' must be 16, 32, or 64 for Gated Delta Rule, got 128. |
+| `fla_chunk_simple_gla` | float32 | chunk:64 | did not return within 900s or the container died (RemoteError: Input aborted due to internal failure (e.g. preemption). Retries are disabled) |
+| `fla_chunk_simple_gla` | bfloat16 | chunk:128 | did not return within 900s or the container died (RemoteError: Input aborted due to internal failure (e.g. preemption). Retries are disabled) |
+| `fla_chunk_gla` | bfloat16 | chunk (size fixed by the kernel):64 | did not return within 900s or the container died (RemoteError: Input aborted due to internal failure (e.g. preemption). Retries are disabled) |
+| `fla_chunk_ttt_linear` | float32 | chunk:256 | did not return within 900s or the container died (RemoteError: Input aborted due to internal failure (e.g. preemption). Retries are disabled) |
+
+Forward only (no backward pass available, so no gradient comparison): `fla_chunk_gated_delta_rule` (float32): fused_recurrent:1; `fla_chunk_gated_delta_rule` (bfloat16): fused_recurrent:1; `fla_chunk_ttt_linear` (float32): chunk:64; `fla_chunk_ttt_linear` (bfloat16): chunk:256.
+
 ### What the kernel tier adds
 
 1. **In float32 the chunked kernels are about 1e-3 from the exact recurrence; the recurrent kernels are not.**
@@ -288,7 +339,7 @@ Inputs with an all-zero gradient in every variant that ran (for LaCT this is exp
 | `fla_chunk_gla` | fused_recurrent:1 | 1.3e-06 | 1.3e-06 |
 | `fla_chunk_gla` | chunk:64 | 1.5e-03 | 5.0e-07 |
 
-   The recurrent kernels are unchanged, as they have no dot products. The chunked kernels fall to float32 rounding, with one exception: `chunk_gated_delta_rule` at chunk 64 keeps a residual about three orders of magnitude above rounding. At chunk 64 that kernel takes a separate fused path that requests TF32 explicitly for its triangular solve, which the environment switch does not override. That is the source: with the solve also set to IEEE (done inside the precision pilot's containers, `results/pilot_precision.csv`), the forward pass at chunk 64 is 3.3e-07 from the float64 recurrence. Gradients were not compared in that configuration.
+   The recurrent kernels are unchanged, as they have no dot products. The chunked kernels fall to float32 rounding, with one exception: `chunk_gated_delta_rule` at chunk 64 keeps a residual about three orders of magnitude above rounding. At chunk 64 that kernel takes a separate fused path that requests TF32 explicitly for its triangular solve, which the environment switch does not override. That is the source: with the solve also set to IEEE (`results/equivalence_kernels_ieee_solve.csv`), chunk 64 is 3.3e-07 from the float64 recurrence in its outputs and 5.1e-07 in its gradients.
 3. **The feasible chunk sizes are set by the kernel, the GPU and the Triton version together.** See the
    refusals table: a fixed list of sizes for the delta-rule kernels, powers of two for the scalar-decay
    kernel, no choice at all for `chunk_gla`, block sizes that exceed this GPU's shared memory for the
@@ -298,6 +349,41 @@ Inputs with an all-zero gradient in every variant that ran (for LaCT this is exp
    for each new chunk size, and compile time grows quickly with the block. Stack dumps of the units that
    went quiet were all inside Triton's compiler (`make_llir`, `make_ptx`) under the autotuner, not in GPU
    execution. The first runs here made this worse by giving the containers Modal's default fractional CPU.
+
+## Result: the same test on trained weights
+
+Everything above uses randomly initialised weights. Here the two pilot models are trained first
+(2000 steps on enwik8, about 5M parameters each) and the test is repeated on the trained weights, with a
+batch of two validation windows of 1024 bytes. Outputs are the logits; gradients are those of the next-byte
+loss with respect to every weight.
+
+Reference ops in float32 and float64, same decision rule as for the untrained models:
+
+| Trained model | Chunk lengths | Output dev. f64 | Gradient dev. f64 | Output dev. f32 | Shrink f32 to f64 | Diagnostic | Class |
+|---|---|---|---|---|---|---|---|
+| gated_deltanet (trained byte-level model, fla kernel) | 1 16 64 256 1024 48 | 3.3e-14 | 1.9e-14 | 3.4e-05 | 1.0e+09 | ROUNDING | **scheduling** |
+| lact (trained byte-level model, official op) | 32 128 512 1024 | 1.7e-01 | 2.5e-01 | 1.7e-01 | 1.0e+00 | STRUCTURAL | **architectural** |
+
+The shipped code on a GPU with the same trained weights. For the Gated DeltaNet model the float64 reference
+is the token-by-token recurrence, the same for every chunk length; for the LaCT model it is the reference
+definition at the same chunk length, so "from first chunk" shows the chunk dependence and "from float64
+reference" shows how closely the shipped op follows its own definition:
+
+| Trained model | Arithmetic | Chunk | Dev. from first chunk, outputs | Dev. from float64 reference, outputs | Dev. from float64 reference, gradients |
+|---|---|---|---|---|---|
+| gated_deltanet (trained byte-level model, fla kernel) | fp32_tf32 | 16 | 0 (identical) | 8.8e-04 | 9.7e-04 |
+| gated_deltanet (trained byte-level model, fla kernel) | fp32_tf32 | 32 | 6.5e-04 | 1.1e-03 | 8.7e-04 |
+| gated_deltanet (trained byte-level model, fla kernel) | fp32_tf32 | 64 | 7.4e-04 | 9.9e-04 | 1.2e-03 |
+| gated_deltanet (trained byte-level model, fla kernel) | bf16 | 16 | 0 (identical) | 9.1e-03 | 1.2e-02 |
+| gated_deltanet (trained byte-level model, fla kernel) | bf16 | 32 | 8.7e-03 | 7.3e-03 | 1.2e-02 |
+| gated_deltanet (trained byte-level model, fla kernel) | bf16 | 64 | 8.7e-03 | 7.2e-03 | 9.4e-03 |
+| lact (trained byte-level model, official op) | bf16 autocast (official op) | 32 | 0 (identical) | 8.5e-03 | n/a |
+| lact (trained byte-level model, official op) | bf16 autocast (official op) | 128 | 2.4e-02 | 8.3e-03 | n/a |
+| lact (trained byte-level model, official op) | bf16 autocast (official op) | 512 | 1.2e-01 | 8.4e-03 | n/a |
+| lact (trained byte-level model, official op) | bf16 autocast (official op) | 1024 | 1.6e-01 | 7.7e-03 | n/a |
+| gated_deltanet (trained byte-level model, fla kernel) | fp32_ieee | 16 | 0 (identical) | 1.2e-06 | 8.0e-07 |
+| gated_deltanet (trained byte-level model, fla kernel) | fp32_ieee | 32 | 1.6e-06 | 1.7e-06 | 1.2e-06 |
+| gated_deltanet (trained byte-level model, fla kernel) | fp32_ieee | 64 | 2.1e-06 | 1.8e-06 | 1.7e-06 |
 
 ## Low precision (descriptive only; this is what the precision study in Milestones 2 and 4 has to measure)
 
@@ -363,10 +449,7 @@ The float16 backward pass is non-finite at every chunk length, the reference one
   from the papers. The library and kernel tiers cover the pinned commits of flash-linear-attention and LaCT
   on the GPUs named above, with `torch.compile` disabled. The official Mamba-2 kernels (`mamba_ssm`) are not
   covered; `chunk_simple_gla` is the same scalar-decay recurrence but a different kernel.
-- **Random initialisation.** The checkpoint is a seeded initialisation, not a trained model. Whether chunk
-  length changes the function does not depend on the weights for the mechanisms above, but the *size* of
-  the rounding deviation does (gates near one, long effective memory). Repeat on a trained checkpoint
-  before quoting magnitudes.
+- **Mostly random initialisation.** The main tables use a seeded initialisation. The test was repeated on two small trained models (section above) with the same outcome; it has not been run on a large or publicly released checkpoint.
 - **HLA is written from the method section of the paper**, not from released code, and is labelled
   HLA-style. The inference-time gate threshold and the training regulariser are not part of the test.
 - **FLASH** follows the paper's pseudo-code with one substitution: a fixed-size table of relative-position

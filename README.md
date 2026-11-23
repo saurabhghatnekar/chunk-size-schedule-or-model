@@ -56,12 +56,22 @@ Controls, all passing on CPU:
 
 Limits, stated once here and in full in the classification document:
 
-- The checkpoints are seeded random initialisations of a tiny model, not trained models.
+- The main tables use seeded random initialisations of a tiny model. The test was repeated on two small
+  trained models (about 5M parameters) with the same outcome; it has not been run on a large or publicly
+  released checkpoint.
 - The reference layers were written for this project from the papers. HLA is written from the method section
   of its paper, not from released code.
 - The mechanism statements are checked numerically. The chunkwise derivations have not yet been redone by hand.
 - The decision thresholds on CPU were written down after a float64 smoke test had been seen, so they are not
   blind. The measured gaps are many orders of magnitude wide.
+
+## The same test on trained weights
+
+Both pilot models were trained (2,000 steps, about 5M parameters) and tested again. With the reference ops the
+trained Gated DeltaNet model agrees across chunk lengths to 3e-14 in float64 and 3e-5 in float32 (scheduling);
+the trained LaCT model differs by 0.02 to 0.17 at both precisions (architectural). On a GPU with the same
+trained weights, the library's Gated DeltaNet kernel is about 1e-3 from the float64 recurrence under the TF32
+default, 2e-6 with IEEE dot products, and 7e-3 to 9e-3 in bfloat16.
 
 ## The same test on code other people ship
 
@@ -69,7 +79,7 @@ Limits, stated once here and in full in the classification document:
 the delta-rule, gated delta-rule and scalar-decay ops agree to rounding, and TTT-Linear, Titans and the
 official LaCT op are structural.
 
-**Triton kernels** were run on one GPU (NVIDIA A10 on Modal, Triton 3.9.0). They have no float64 path, so
+**Triton kernels** were run on two GPUs (NVIDIA A10 and H100 on Modal, Triton 3.9.0), with the same picture on both. They have no float64 path, so
 each kernel is compared with a float64 oracle on the same inputs. What that showed:
 
 1. **In bfloat16 and float16 the exact-family kernels sit within a few quantisation floors** of the oracle
@@ -79,12 +89,13 @@ each kernel is compared with a float64 oracle on the same inputs. What that show
    while the recurrent kernels match it to 1e-6. The cause is TF32: Triton's dot product defaults to TF32 for
    float32 operands on tensor-core GPUs, and rerunning with `TRITON_F32_DEFAULT=ieee` brings the chunked
    kernels down to about 3e-7. The one exception, Gated DeltaNet at chunk 64, keeps a residual near 2e-4
-   because that path requests TF32 explicitly for its triangular solve; with that also set to IEEE its forward
-   pass matches to 3e-7. So on
+   because that path requests TF32 explicitly for its triangular solve; with that also set to IEEE its outputs
+   and gradients match to about 5e-7. So on
    these kernels "float32" is not float32 by default, and choosing the chunked form over the recurrent one
    costs about four orders of magnitude of numerical agreement. That matters for the planned precision study.
 3. **The test-time-training kernels are chunk-dependent and match their per-chunk reference**, as expected.
-4. **Kernels constrain which chunk sizes can be studied at all.** At the pinned commits, on this GPU: the
+4. **Kernels constrain which chunk sizes can be studied at all.** At the pinned commits, on the A10 (the H100
+   accepts a little more, for example TTT-Linear at chunk 256 in bfloat16): the
    delta-rule kernels accept only 16, 32 and 64 (and DeltaNet refuses float32 input); the scalar-decay kernel
    needs a power of two and runs out of shared memory at 128 or 256 depending on the format; `chunk_gla` chooses its own size; TTT-Linear
    fits only chunk 16 with gradients; LaCT's fused kernel does not compile on this Triton version.
@@ -221,8 +232,9 @@ The last line is the ablation behind point 2 above; its rows are in `results/equ
 The plan itself ("the roadmap" in the documents here) is a separate document and is not part of this
 repository.
 
-Open items for Milestone 1: derive the chunkwise forms by hand; repeat the kernel tier on a second GPU; repeat the test on a trained checkpoint; write the
-paragraph on why the HLA and FLASH ablations do not transfer to an exact kernel.
+Open items for Milestone 1: derive the chunkwise forms by hand; run the test on a large or publicly released
+checkpoint; test the official Mamba-2 kernels; write the paragraph on why the HLA and FLASH ablations do not
+transfer to an exact kernel.
 
 ## Acknowledgements and licences
 

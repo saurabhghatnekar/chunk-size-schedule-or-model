@@ -121,6 +121,101 @@ def bench(sizes: str = "42M,160M,410M", chunks: str = "32,128,512,1024", batch: 
     print(f"wrote {out}")
 
 
+@app.function(gpu=GPU, cpu=8.0, timeout=3600, max_containers=10, single_use_containers=True)
+def trained_gdn(steps: int, regime: str, state: bytes | None = None, tokens_and_oracle: bytes | None = None):
+    """Train the Gated DeltaNet pilot model (or take trained weights), then run the equivalence test on them.
+
+    The first call trains in bfloat16, runs the CPU reference ladder and the kernel comparison in this
+    container's arithmetic, and returns the weights and the float64 oracle. A second call in an IEEE
+    container reuses both, so the same trained weights are tested under each arithmetic."""
+    import io
+
+    if regime == "fp32_ieee":
+        os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    import torch
+
+    from src.pilot import trained_check
+    from src.pilot.precision import ByteLM, PilotConfig, configure_arithmetic, run
+
+    cfg = PilotConfig(regime="bf16", chunk=64, seed=0, steps=steps)
+    base = {"architecture": "gated_deltanet (trained byte-level model, fla kernel)", "prior": "exact",
+            "gpu": torch.cuda.get_device_name(0), "steps": steps}
+    if state is None:
+        sink = {}
+        train_rows = run(cfg, sink=sink)
+        model = sink["model"]
+        base["trained_val_loss"] = train_rows[-1]["val_loss_ref"]
+        tokens, oracle = trained_check.gdn_oracle(model, cfg)
+        rows = trained_check.gdn_kernel_rows(model, cfg, tokens, oracle, ("fp32_tf32", "bf16"), base)
+        buf, buf2 = io.BytesIO(), io.BytesIO()
+        torch.save({"state_dict": model.cpu().state_dict(), "tokens": tokens}, buf)
+        torch.save({"tokens": tokens, "oracle": oracle, "trained_val_loss": base["trained_val_loss"]}, buf2)
+        return rows, buf.getvalue(), buf2.getvalue()
+    arithmetic = configure_arithmetic(regime)
+    model = ByteLM(cfg)
+    model.load_state_dict(torch.load(io.BytesIO(state), weights_only=True)["state_dict"])
+    extra = torch.load(io.BytesIO(tokens_and_oracle), weights_only=True)
+    base.update(trained_val_loss=extra["trained_val_loss"], **arithmetic)
+    rows = trained_check.gdn_kernel_rows(model, cfg, extra["tokens"], extra["oracle"], (regime,), base)
+    return rows, None, None
+
+
+@app.function(gpu=GPU, cpu=8.0, timeout=3600, max_containers=10, single_use_containers=True)
+def trained_lact(steps: int):
+    import io
+
+    import torch
+
+    from src.pilot import trained_check
+    from src.pilot.architectural import ArchConfig, run
+
+    cfg = ArchConfig(chunk=128, seed=0, steps=steps)
+    sink = {}
+    train_rows = run(cfg, sink=sink)
+    base = {"architecture": "lact (trained byte-level model, official op)", "prior": "boundary",
+            "gpu": torch.cuda.get_device_name(0), "steps": steps, "trained_val_loss": train_rows[-1]["val_loss"]}
+    rows, tokens = trained_check.lact_official_rows(sink["model"], cfg, base)
+    buf = io.BytesIO()
+    torch.save({"state_dict": sink["model"].cpu().state_dict(), "tokens": tokens}, buf)
+    return rows, buf.getvalue()
+
+
+@app.local_entrypoint()
+def trained(steps: int = 2000):
+    """The equivalence test on trained weights.
+
+        uv run modal run modal_pilot.py::trained
+    """
+    import datetime as dt
+
+    import pandas as pd
+
+    root = Path(__file__).resolve().parent
+    out = root / "results" / "equivalence_trained.csv"
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = []
+
+    def save(new_rows):  # after every return, so nothing that came back can be lost
+        rows.extend(new_rows)
+        pd.DataFrame(rows).assign(run_utc=stamp).to_csv(out, index=False)
+
+    gdn_call = trained_gdn.spawn(steps, "bf16")
+    lact_call = trained_lact.spawn(steps)
+    gdn_rows, gdn_state, gdn_extra = gdn_call.get()
+    (root / "checkpoints" / "trained_gated_deltanet.pt").write_bytes(gdn_state)
+    save(gdn_rows)
+    print(f"  gated deltanet: {len(gdn_rows)} kernel rows, weights saved", flush=True)
+    ieee_call = trained_gdn.spawn(steps, "fp32_ieee", gdn_state, gdn_extra)
+    lact_rows, lact_state = lact_call.get()
+    (root / "checkpoints" / "trained_lact.pt").write_bytes(lact_state)
+    save(lact_rows)
+    print(f"  lact: {len(lact_rows)} rows, weights saved", flush=True)
+    ieee_rows, _, _ = ieee_call.get()
+    save(ieee_rows)
+    print(f"  gated deltanet, IEEE kernels: {len(ieee_rows)} rows", flush=True)
+    print(f"wrote {out}; now run: uv run python -m src.pilot.trained_check   (the CPU reference ladders)")
+
+
 @app.local_entrypoint()
 def confirm(rung: str = "A", steps: int = 2000):
     """The confirmatory pilot (docs/go_no_go_confirmatory.md).

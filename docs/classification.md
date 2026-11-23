@@ -288,7 +288,7 @@ Inputs with an all-zero gradient in every variant that ran (for LaCT this is exp
 | `fla_chunk_gla` | fused_recurrent:1 | 1.3e-06 | 1.3e-06 |
 | `fla_chunk_gla` | chunk:64 | 1.5e-03 | 5.0e-07 |
 
-   The recurrent kernels are unchanged, as they have no dot products. The chunked kernels fall to float32 rounding, with one exception: `chunk_gated_delta_rule` at chunk 64 keeps a residual about three orders of magnitude above rounding. That kernel selects TF32 explicitly for its triangular solve, which the environment switch does not override; whether that is the source of the residual has not been checked.
+   The recurrent kernels are unchanged, as they have no dot products. The chunked kernels fall to float32 rounding, with one exception: `chunk_gated_delta_rule` at chunk 64 keeps a residual about three orders of magnitude above rounding. At chunk 64 that kernel takes a separate fused path that requests TF32 explicitly for its triangular solve, which the environment switch does not override. That is the source: with the solve also set to IEEE (done inside the precision pilot's containers, `results/pilot_precision.csv`), the forward pass at chunk 64 is 3.3e-07 from the float64 recurrence. Gradients were not compared in that configuration.
 3. **The feasible chunk sizes are set by the kernel, the GPU and the Triton version together.** See the
    refusals table: a fixed list of sizes for the delta-rule kernels, powers of two for the scalar-decay
    kernel, no choice at all for `chunk_gla`, block sizes that exceed this GPU's shared memory for the

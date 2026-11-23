@@ -21,6 +21,8 @@ Write-ups: [pilot_architectural.md](pilot_architectural.md), [pilot_confirmatory
 
 ## 2. A precision effect above noise on the scheduling class: **Not met.**
 
+No chunk-length effect on final loss was detected at this scale.
+
 | Arithmetic | Outcome | Largest same-seed change, chunk 64 against 16 | Seed spread |
 |---|---|---|---|
 | bfloat16 | NO EFFECT DETECTED | 0.0019 | 0.0038 |
@@ -38,9 +40,9 @@ precision study, the ablations and reruns. Details: [compute_budget.md](compute_
 
 ## Decision on the science
 
-**NO-GO for the full paper, by the rule as written.** The confirmatory test needed t above 3.365 (one-sided 1%) and got 2.73, so by the rule neither branch shows an effect above noise, and the roadmap's fallback applies: the shorter paper built on the test, the classification, the kernel findings and the negative results.
+**NO-GO for the full paper, by the rule as written.** The confirmatory test needed t above 3.365 (one-sided 1%) and got 2.73. The registered test did not pass, which is not the same as showing there is no effect. With the precision pilot detecting no chunk-length effect either, the roadmap's fallback applies: the shorter paper built on the test, the classification, the kernel findings and what the pilots did and did not detect.
 
-**What the rule did not use, stated so the reader can weigh it.** The verdict above is not softened by this. In rung A the larger chunk was worse in 6 of 6 new seeds, and in rung B in 3 of 3. The run-to-run floor is 0.0013 nats; the smallest rung A difference is 0.0057 (4.2 floors) and the mean is 0.0150 (11 floors). The test failed at the 1% level because one seed's difference, in the predicted direction, was several times the others and inflated the variance. A paired t-test at 1% with six seeds was a fragile choice of statistic; that was a design error made before the data, and it is the rule that was registered. A reader who weighs these facts may reasonably conclude the effect is real at this scale. The rule does not license saying so as a result.
+**What the rule did not use, stated so the reader can weigh it.** The verdict above is not softened by this. In rung A the larger chunk was worse in 6 of 6 new seeds, and in rung B in 3 of 3 (rung B reuses seeds 5 to 7, so the two sets are not independent and are not pooled). The run-to-run floor is 0.0013 nats; the smallest rung A difference is 0.0057 (4.2 floors) and the mean is 0.0150 (11 floors). The test failed at the 1% level because one seed's difference, in the predicted direction, was several times the others and inflated the variance. A paired t-test at 1% with six seeds was a fragile choice of statistic; that was a design error made before the data, and it is the rule that was registered. A reader who weighs these facts may reasonably conclude the effect is real at this scale. The rule does not license saying so as a result.
 
 ## What the decision rests on, and what it does not
 

@@ -81,8 +81,9 @@ def summarise(frame: pd.DataFrame) -> dict:
     out["verdict_A"] = decide_a(out["d_A"], out["floor"]) if out["d_A"] else "INCOMPLETE"
     out["verdict_B"] = decide_b(out["d_B"], out["floor"]) if out["d_B"] else "INCOMPLETE"
     if out["verdict_A"] == "NO EFFECT":
-        out["science"] = ("NO-GO for the full paper", "neither the precision branch nor the architectural branch shows an "
-                          "effect above noise; fall back to the shorter paper the roadmap describes")
+        out["science"] = ("NO-GO for the full paper", "the registered confirmatory test did not pass, and the precision "
+                          "pilot detected no chunk-length effect, so the fallback is the shorter paper the roadmap "
+                          "describes. A test that does not pass is not a demonstration that there is no effect")
     elif out["verdict_A"] == "INCOMPLETE":
         out["science"] = ("UNDECIDED", "rung A did not complete")
     else:
@@ -144,6 +145,51 @@ T_LADDER = {5: [(0.05, 2.015), (0.025, 2.571), (0.01, 3.365), (0.005, 4.032)],
             3: [(0.05, 2.353), (0.025, 3.182), (0.01, 4.541), (0.005, 5.841)]}
 
 
+def t_upper_tail(t: float, df: int, steps: int = 200000, upper: float = 200.0) -> float:
+    """One-sided p-value of Student's t by integrating its density (no SciPy dependency)."""
+    c = math.gamma((df + 1) / 2) / (math.sqrt(df * math.pi) * math.gamma(df / 2))
+    h = (upper - t) / steps
+    return sum(c * (1 + (t + (i + 0.5) * h) ** 2 / df) ** (-(df + 1) / 2) for i in range(steps)) * h
+
+
+def elapsed_time_section(frame: pd.DataFrame) -> str:
+    """Exploratory: the same runs read against elapsed time instead of steps."""
+    ok = frame[(frame["status"] == "ok") & (frame["d_model"] == RUNG_WIDTH["A"])].copy()
+    ok = ok[ok["replicate"].fillna(0).astype(int) == 0]
+    if ok.empty:
+        return ""
+    cell = ok.groupby(["chunk", "step"]).agg(minutes=("wall_s", lambda v: v.mean() / 60), loss=("val_loss", "mean"),
+                                             tokens=("tokens_per_s", "mean")).reset_index()
+    lines = ["| Chunk | Step | Elapsed minutes (mean of six runs) | Held-out loss (mean) |", "|---|---|---|---|"]
+    for _, row in cell.iterrows():
+        label = f"{int(row['chunk'])} (no test-time training)" if int(row["chunk"]) == 1024 else str(int(row["chunk"]))
+        lines.append(f"| {label} | {int(row['step'])} | {row['minutes']:.1f} | {row['loss']:.3f} |")
+    cards = ok[ok["final"] == True].groupby("chunk")["gpu"].agg(lambda g: ", ".join(f"{n} on {k}" for k, n in g.value_counts().items()))  # noqa: E712
+    try:
+        t32 = cell[(cell["chunk"] == 32) & (cell["step"] == 500)].iloc[0]
+        t512 = cell[(cell["chunk"] == 512) & (cell["step"] == 1500)].iloc[0]
+        example = (f"At about {t32['minutes']:.1f} minutes the chunk-32 runs had done 500 steps (loss {t32['loss']:.3f}) while the "
+                   f"chunk-512 runs, at {t512['minutes']:.1f} minutes, had done 1,500 (loss {t512['loss']:.3f}). At 2,000 steps the "
+                   f"order is the other way round.")
+    except IndexError:
+        example = ""
+    return f"""## Exploratory: the same runs against elapsed time
+
+Not part of any registered analysis. Rung A, first run of each seed:
+
+{chr(10).join(lines)}
+
+{example} So at equal steps the smaller chunk is ahead, and at equal elapsed time, in these runs, the larger
+chunk is ahead.
+
+Why this is only suggestive: the learning-rate schedule was tied to 2,000 steps, so a run stopped early by
+the clock is mid-schedule; the cells did not all run on one GPU model ({"; ".join(f"chunk {int(c)}: {v}" for c, v in cards.items())});
+and the small-chunk cost is dominated by a Python loop in the op as run here (no `torch.compile`, no fused
+kernel), so the time axis depends on the implementation as much as on the method. A proper answer fixes the
+time budget, the schedule, the GPU model and the implementation in advance.
+"""
+
+
 def outside_the_rule(r: dict) -> str:
     """Facts the pre-registered rule does not use. Reported for the reader, never to change the verdict."""
     d_a, d_b, floor = r["d_A"], r["d_B"], r["floor"]
@@ -161,11 +207,16 @@ def outside_the_rule(r: dict) -> str:
     rest_mean, rest_sd, rest_t = paired(rest) if len(rest) >= 2 else (float("nan"),) * 3
     lines = [
         f"- **Sign.** The larger chunk is worse in {sum(x > 0 for x in d_a)} of {len(d_a)} new seeds in rung A"
-        + (f" and {sum(x > 0 for x in d_b)} of {len(d_b)} in rung B." if d_b else "."),
+        + (f" and {sum(x > 0 for x in d_b)} of {len(d_b)} in rung B. Rung B reuses seeds 5, 6 and 7, so it shares their "
+           f"order of training windows with rung A and is not an independent set of seeds; the sets should be read "
+           f"separately and not pooled." if d_b else "."),
         f"- **Size against the run-to-run floor.** The floor is {floor:.4f}. The smallest of the {len(d_a)} rung A differences is "
         f"{min(d_a):.4f}, which is {min(d_a) / floor:.1f} floors; the mean is {mean / floor:.0f} floors. Reruns of this model "
         f"are nearly reproducible, unlike the Gated DeltaNet kernels in the precision pilot.",
-        f"- **Where t falls.** t = {t:.2f} with {len(d_a) - 1} degrees of freedom. {where}.",
+        f"- **Where t falls.** t = {t:.2f} with {len(d_a) - 1} degrees of freedom, a one-sided p of "
+        f"{t_upper_tail(t, len(d_a) - 1):.4f}. {where}. An exact one-sided sign test on {sum(x > 0 for x in d_a)} of "
+        f"{len(d_a)} gives p = {0.5 ** len(d_a):.4f}, which is also above 1%. With {len(d_a)} pairs that is the smallest p a "
+        f"sign or rank test can give, so only a parametric test could have cleared the registered level.",
         f"- **Why t is low.** One seed has a difference of {biggest:+.4f}, about {biggest / (sum(rest) / len(rest)):.0f} times the "
         f"others. It is in the predicted direction, but it inflates the standard deviation the t statistic divides by. "
         f"Without it the other {len(rest)} give mean {rest_mean:+.4f}, standard deviation {rest_sd:.4f}, t = {rest_t:.2f}. "
@@ -209,7 +260,7 @@ Criteria file hash stored in the result rows: `{sha_run[:16]}`. Hash of the file
 **Hypothesis fixed in advance.** At an equal number of training steps, a LaCT-style layer trained with chunk
 length 32 reaches a lower held-out loss than the same model trained with chunk length 512.
 
-## Rung A: verdict {r['verdict_A']}
+## Rung A: verdict {r['verdict_A']}{" (the registered test did not pass)" if r['verdict_A'] == "NO EFFECT" else ""}
 
 Six seeds never used before, 5.2M parameters, final held-out loss in nats per byte:
 
@@ -225,7 +276,8 @@ Floor used by the rule (the largest span): **{r['floor']:.4f}**.
 
 ## Rung B: verdict {r['verdict_B']}
 
-About 39M parameters, three seeds:
+About 39M parameters, three seeds (5, 6 and 7, the same seed numbers as in rung A, so the same order of
+training windows with a different, larger model):
 
 {_table(r['table_B']) if len(r['table_B']) else "No runs completed."}
 
@@ -249,6 +301,7 @@ By the table fixed in advance: {r['science'][1]}.
 
 {"## Runs that did not complete" + chr(10) + chr(10) + failed[[c for c in ("rung", "d_model", "chunk", "seed", "replicate", "status") if c in failed]].to_string(index=False) if len(failed) else ""}
 
+{elapsed_time_section(frame)}
 ## What this does and does not say
 
 - The comparison is at equal steps. Measured training throughput in tokens per second: {speed}. Chunk 32 costs

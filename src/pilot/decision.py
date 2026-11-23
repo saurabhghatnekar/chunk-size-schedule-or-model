@@ -38,12 +38,14 @@ def main() -> int:
                   "established. Proceed to the roadmap-scale pilot before committing to the grid.")
     elif science.startswith("NO-GO"):
         bottom = (f"**NO-GO for the full paper, by the rule as written.** The confirmatory test needed t above {a['t_crit']} "
-                  f"(one-sided 1%) and got {a['t']:.2f}, so by the rule neither branch shows an effect above noise, and the "
-                  "roadmap's fallback applies: the shorter paper built on the test, the classification, the kernel findings "
-                  "and the negative results.\n\n"
+                  f"(one-sided 1%) and got {a['t']:.2f}. The registered test did not pass, which is not the same as showing "
+                  "there is no effect. With the precision pilot detecting no chunk-length effect either, the roadmap's "
+                  "fallback applies: the shorter paper built on the test, the classification, the kernel findings and "
+                  "what the pilots did and did not detect.\n\n"
                   "**What the rule did not use, stated so the reader can weigh it.** The verdict above is not softened by "
                   f"this. In rung A the larger chunk was worse in {int(a['positive'])} of {int(a['seeds'])} new seeds, and in "
-                  f"rung B in {int(b['positive'])} of {int(b['seeds'])}. The run-to-run floor is {a['floor']:.4f} nats; the "
+                  f"rung B in {int(b['positive'])} of {int(b['seeds'])} (rung B reuses seeds 5 to 7, so the two sets are not "
+                  f"independent and are not pooled). The run-to-run floor is {a['floor']:.4f} nats; the "
                   f"smallest rung A difference is {a['d_min']:.4f} ({a['d_min'] / a['floor']:.1f} floors) and the mean is "
                   f"{a['d_mean']:.4f} ({a['d_mean'] / a['floor']:.0f} floors). The test failed at the 1% level because one seed's "
                   "difference, in the predicted direction, was several times the others and inflated the variance. A "
@@ -75,6 +77,8 @@ noise on the scheduling class, **and** the compute budget covers a reduced grid.
 Write-ups: [pilot_architectural.md](pilot_architectural.md), [pilot_confirmatory.md](pilot_confirmatory.md).
 
 ## 2. A precision effect above noise on the scheduling class: **Not met.**
+
+No chunk-length effect on final loss was detected at this scale.
 
 | Arithmetic | Outcome | Largest same-seed change, chunk 64 against 16 | Seed spread |
 |---|---|---|---|

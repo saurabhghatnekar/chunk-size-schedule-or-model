@@ -78,7 +78,9 @@ each kernel is compared with a float64 oracle on the same inputs. What that show
 2. **With float32 inputs the chunked kernels are about 1e-3 from the exact recurrence** at every chunk size,
    while the recurrent kernels match it to 1e-6. The cause is TF32: Triton's dot product defaults to TF32 for
    float32 operands on tensor-core GPUs, and rerunning with `TRITON_F32_DEFAULT=ieee` brings the chunked
-   kernels down to about 3e-7 (one exception: Gated DeltaNet at chunk 64 keeps a residual near 2e-4). So on
+   kernels down to about 3e-7. The one exception, Gated DeltaNet at chunk 64, keeps a residual near 2e-4
+   because that path requests TF32 explicitly for its triangular solve; with that also set to IEEE its forward
+   pass matches to 3e-7. So on
    these kernels "float32" is not float32 by default, and choosing the chunked form over the recurrent one
    costs about four orders of magnitude of numerical agreement. That matters for the planned precision study.
 3. **The test-time-training kernels are chunk-dependent and match their per-chunk reference**, as expected.
@@ -99,7 +101,7 @@ with the library's Gated DeltaNet kernel was trained at chunk 16 and chunk 64, t
 arithmetics: bfloat16, float32 with Triton's TF32 default, and float32 with IEEE dot products. The criteria
 were written down first ([docs/go_no_go.md](docs/go_no_go.md)).
 
-**No effect detected in any arithmetic.** At a fixed seed, chunk 64 against chunk 16 moved the final held-out
+**No chunk-length effect on final loss was detected at this scale, in any arithmetic.** At a fixed seed, chunk 64 against chunk 16 moved the final held-out
 loss by at most 0.002 nats (bfloat16), 0.0004 (TF32) and 0.0008 (IEEE), against a seed-to-seed spread of about
 0.004. The size of the difference does not track the size of the kernel's numerical error, which spans four
 orders of magnitude across the three arithmetics.
@@ -139,13 +141,20 @@ combination rule fixed in advance ([docs/go_no_go_confirmatory.md](docs/go_no_go
 same-seed reruns for a noise floor and a second rung at about 39M parameters.
 
 **By the rule as written: no-go for the full paper.** The test needed a paired t above 3.365 (one-sided 1%)
-and got 2.73, so the hypothesis is not confirmed at the registered level.
+and got 2.73 (p = 0.021). The registered test did not pass, which is not the same as showing no effect.
 
-**What the rule did not use.** Chunk 512 was worse than chunk 32 in 6 of 6 new seeds, and in 3 of 3 at the
-larger size. The run-to-run floor of this model is 0.0013 nats; the smallest difference was 0.0057 and the
+**What the rule did not use.** Chunk 512 was worse than chunk 32 in 6 of 6 new seeds (an exact sign test gives
+p = 0.016, also above 1%), and in 3 of 3 at the larger size, which reuses seeds 5 to 7 and so is not an
+independent set. The run-to-run floor of this model is 0.0013 nats; the smallest difference was 0.0057 and the
 mean 0.015. The test fell short because one seed's difference, in the predicted direction, was four times the
 others and inflated the variance. A paired t-test at 1% with six seeds was a fragile choice made before the
 data. The verdict stands as registered; the facts are reported so a reader can weigh them.
+
+**The wall-clock question is open and may point the other way.** Read against elapsed time, the same runs
+favour the larger chunk: at about five and a half minutes the chunk-512 runs had reached a loss of 1.270 and
+the chunk-32 runs 1.491, while at equal steps chunk 32 ends ahead. This is exploratory (the schedule was tied
+to steps and the cells did not share one GPU model); see the last section of
+[docs/pilot_confirmatory.md](docs/pilot_confirmatory.md).
 
 The compute budget for the reduced grid, from throughput measured at 160M and 410M parameters on an H100, is
 about $690 per seed per billion training tokens, two thirds of it chunk 32

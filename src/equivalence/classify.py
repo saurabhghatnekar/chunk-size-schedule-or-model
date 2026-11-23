@@ -269,6 +269,16 @@ the variant was still compiling; in an earlier run the same variants ran into th
                      "variant is a chunk of at least the sequence length, which never updates the fast weights): "
                      + "; ".join(f"`{a}` ({d}): {m}" for a, d, m in zip(missing["architecture"], missing["dtype"], missing["inputs_without_gradient"])) + ".\n")
         parts.append(text)
+    pilot_csv = RESULTS / "pilot_precision.csv"
+    solve_note = "Whether that is the source of the residual has not been checked."
+    if pilot_csv.exists():
+        pilot = pd.read_csv(pilot_csv)
+        fixed = pilot[(pilot["regime"] == "fp32_ieee") & (pilot["chunk"] == 64) & pilot["kernel_oracle_dev"].notna()]
+        if len(fixed):
+            solve_note = (f"That is the source: with the solve also set to IEEE (done inside the precision pilot's "
+                          f"containers, `results/pilot_precision.csv`), the forward pass at chunk 64 is "
+                          f"{fmt(fixed['kernel_oracle_dev'].max())} from the float64 recurrence. Gradients were not "
+                          f"compared in that configuration.")
     ieee_csv = RESULTS / "equivalence_kernels_ieee.csv"
     if ieee_csv.exists():
         both = []
@@ -285,9 +295,9 @@ the variant was still compiling; in an earlier run the same variants ran into th
                     + md_table(table, {"arch": "Kernel", "what": "Variant:chunk", "default_s": "Triton default (TF32)", "ieee_s": "IEEE"})
                     + "\n\n   The recurrent kernels are unchanged, as they have no dot products. The chunked kernels fall to "
                     "float32 rounding, with one exception: `chunk_gated_delta_rule` at chunk 64 keeps a residual about "
-                    "three orders of magnitude above rounding. That kernel selects TF32 explicitly for its triangular "
-                    "solve, which the environment switch does not override; whether that is the source of the residual "
-                    "has not been checked.")
+                    "three orders of magnitude above rounding. At chunk 64 that kernel takes a separate fused path "
+                    "that requests TF32 explicitly for its triangular solve, which the environment switch does not "
+                    "override. " + solve_note)
     else:
         ablation_title = "The likely cause is TF32, and it has not been isolated."
         ablation = "That rerun has **not** been done yet, so TF32 remains the likely cause and not a demonstrated one."

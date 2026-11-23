@@ -9,7 +9,7 @@ Criteria file hash stored in the result rows: `14f5fbb1d1e626f0`. Hash of the fi
 **Hypothesis fixed in advance.** At an equal number of training steps, a LaCT-style layer trained with chunk
 length 32 reaches a lower held-out loss than the same model trained with chunk length 512.
 
-## Rung A: verdict NO EFFECT
+## Rung A: verdict NO EFFECT (the registered test did not pass)
 
 Six seeds never used before, 5.2M parameters, final held-out loss in nats per byte:
 
@@ -33,7 +33,8 @@ Floor used by the rule (the largest span): **0.0013**.
 
 ## Rung B: verdict CONSISTENT
 
-About 39M parameters, three seeds:
+About 39M parameters, three seeds (5, 6 and 7, the same seed numbers as in rung A, so the same order of
+training windows with a different, larger model):
 
 | Seed | chunk 32 | chunk 512 | chunk 1024 | chunk 512 minus chunk 32 |
 |---|---|---|---|---|
@@ -55,15 +56,15 @@ CONSISTENT if the difference is positive in all three seeds and its mean exceeds
 
 ## Decision on the science: NO-GO for the full paper
 
-By the table fixed in advance: neither the precision branch nor the architectural branch shows an effect above noise; fall back to the shorter paper the roadmap describes.
+By the table fixed in advance: the registered confirmatory test did not pass, and the precision pilot detected no chunk-length effect, so the fallback is the shorter paper the roadmap describes. A test that does not pass is not a demonstration that there is no effect.
 
 ## Outside the rule: what the verdict does not use
 
 These are facts about the same data. They do not change the verdict above, which is the one the rule gives.
 
-- **Sign.** The larger chunk is worse in 6 of 6 new seeds in rung A and 3 of 3 in rung B.
+- **Sign.** The larger chunk is worse in 6 of 6 new seeds in rung A and 3 of 3 in rung B. Rung B reuses seeds 5, 6 and 7, so it shares their order of training windows with rung A and is not an independent set of seeds; the sets should be read separately and not pooled.
 - **Size against the run-to-run floor.** The floor is 0.0013. The smallest of the 6 rung A differences is 0.0057, which is 4.2 floors; the mean is 11 floors. Reruns of this model are nearly reproducible, unlike the Gated DeltaNet kernels in the precision pilot.
-- **Where t falls.** t = 2.73 with 5 degrees of freedom. It clears the one-sided 2.5% level and not the 1.0% level.
+- **Where t falls.** t = 2.73 with 5 degrees of freedom, a one-sided p of 0.0206. It clears the one-sided 2.5% level and not the 1.0% level. An exact one-sided sign test on 6 of 6 gives p = 0.0156, which is also above 1%. With 6 pairs that is the smallest p a sign or rank test can give, so only a parametric test could have cleared the registered level.
 - **Why t is low.** One seed has a difference of +0.0419, about 4 times the others. It is in the predicted direction, but it inflates the standard deviation the t statistic divides by. Without it the other 5 give mean +0.0096, standard deviation 0.0028, t = 7.53. Dropping a seed after the fact is not allowed; this only explains the number.
 
 ![Confirmatory pilot](../results/figures/pilot_confirmatory.png)
@@ -71,6 +72,34 @@ These are facts about the same data. They do not change the verdict above, which
 *One dot per run; lines join the runs that share a seed.*
 
 
+
+## Exploratory: the same runs against elapsed time
+
+Not part of any registered analysis. Rung A, first run of each seed:
+
+| Chunk | Step | Elapsed minutes (mean of six runs) | Held-out loss (mean) |
+|---|---|---|---|
+| 32 | 500 | 5.3 | 1.491 |
+| 32 | 1000 | 10.5 | 1.337 |
+| 32 | 1500 | 15.7 | 1.256 |
+| 32 | 2000 | 21.0 | 1.233 |
+| 512 | 500 | 1.8 | 1.494 |
+| 512 | 1000 | 3.6 | 1.345 |
+| 512 | 1500 | 5.4 | 1.270 |
+| 512 | 2000 | 7.2 | 1.248 |
+| 1024 (no test-time training) | 500 | 1.4 | 1.496 |
+| 1024 (no test-time training) | 1000 | 2.7 | 1.351 |
+| 1024 (no test-time training) | 1500 | 4.1 | 1.278 |
+| 1024 (no test-time training) | 2000 | 5.4 | 1.257 |
+
+At about 5.3 minutes the chunk-32 runs had done 500 steps (loss 1.491) while the chunk-512 runs, at 5.4 minutes, had done 1,500 (loss 1.270). At 2,000 steps the order is the other way round. So at equal steps the smaller chunk is ahead, and at equal elapsed time, in these runs, the larger
+chunk is ahead.
+
+Why this is only suggestive: the learning-rate schedule was tied to 2,000 steps, so a run stopped early by
+the clock is mid-schedule; the cells did not all run on one GPU model (chunk 32: 6 on NVIDIA A10; chunk 512: 4 on NVIDIA A10G, 2 on NVIDIA A10; chunk 1024: 4 on NVIDIA A10, 2 on NVIDIA A10G);
+and the small-chunk cost is dominated by a Python loop in the op as run here (no `torch.compile`, no fused
+kernel), so the time axis depends on the implementation as much as on the method. A proper answer fixes the
+time budget, the schedule, the GPU model and the implementation in advance.
 
 ## What this does and does not say
 
